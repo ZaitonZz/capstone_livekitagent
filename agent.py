@@ -3,6 +3,9 @@ import logging
 import os
 import concurrent.futures
 import json
+import time
+import base64
+import io
 import numpy as np
 import aiohttp
 from dotenv import load_dotenv
@@ -108,10 +111,17 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext):
     logger.info(f"Video track subscribed: {track.sid}")
     
     video_stream = rtc.VideoStream(track)
+    last_post_time = 0
     
     # Maintain a session for repeated HTTP requests to the backend
     async with aiohttp.ClientSession() as http_session:
         async for event in video_stream:
+            current_time = time.time()
+            # Throttle to 1 update per second to avoid overloading Laravel backend
+            if current_time - last_post_time < 1.0:
+                continue
+            last_post_time = current_time
+
             # `event.frame` contains the raw rtc.VideoFrame (often I420)
             rtc_frame = event.frame
             
@@ -123,6 +133,13 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext):
             # and slice off Alpha to just get RGB
             rgb_data = frame_data.reshape((argb_frame.height, argb_frame.width, 4))[:, :, 1:]
             
+            # Encode image as base64 JPEG for verification UI
+            img = Image.fromarray(rgb_data, 'RGB')
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG", quality=60)
+            img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            image_data_uri = f"data:image/jpeg;base64,{img_b64}"
+            
             # Run the parallel pipeline over the frame
             inference_results = await pipeline.run_parallel_inference(rgb_data)
             
@@ -132,6 +149,7 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext):
                 "timestamp": event.timestamp_us,
                 "width": argb_frame.width,
                 "height": argb_frame.height,
+                "image": image_data_uri,
                 "ml_results": inference_results
             }
             
