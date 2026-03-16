@@ -129,7 +129,7 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext):
             # Prepare payload for Laravel
             payload = {
                 "track_id": track.sid,
-                "timestamp": event.timestamp,
+                "timestamp": event.timestamp_us,
                 "width": argb_frame.width,
                 "height": argb_frame.height,
                 "ml_results": inference_results
