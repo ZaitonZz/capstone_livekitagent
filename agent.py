@@ -9,6 +9,9 @@ import io
 import numpy as np
 import aiohttp
 from dotenv import load_dotenv
+import cv2
+import insightface
+from insightface.app import FaceAnalysis
 
 from livekit.agents import (
     AutoSubscribe,
@@ -37,32 +40,44 @@ class PipelineManager:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using compute device: {self.device}")
         
-        # TODO: Define and load your specific .pth models here
-        # E.g.,
-        # self.model_a = MyCustomModelA().to(self.device)
-        # self.model_a.load_state_dict(torch.load("models/model_A.pth", map_location=self.device))
-        # self.model_a.eval()
-        #
-        # self.model_b = MyCustomModelB().to(self.device)
-        # self.model_b.load_state_dict(torch.load("models/model_B.pth", map_location=self.device))
-        # self.model_b.eval()
+        # Initialize actual InsightFace (SCRFD) model for detection
+        # Note: 'buffalo_l' is a standard high-accuracy pack covering detection/recognition.
+        # It automatically downloads models to ~/.insightface/models/ on first run.
+        logger.info("Loading SCRFD InsightFace Model...")
+        self.face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection'])
+        ctx_id = 0 if torch.cuda.is_available() else -1
+        self.face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+        logger.info("SCRFD Loaded successfully!")
         
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-    def _inference_model_a(self, tensor_frame):
-        """Synchronous CPU/GPU bound inference for Model A (Simulated SCRFD)"""
-        # Simulated SCRFD face detection results: [x1, y1, x2, y2, confidence]
-        import random
-        # Fake a face detection in the middle of the frame
-        x1, y1 = random.randint(100, 150), random.randint(100, 150)
-        x2, y2 = x1 + random.randint(100, 200), y1 + random.randint(100, 200)
-        confidence = round(random.uniform(0.85, 0.99), 4)
+    def _inference_model_a(self, tensor_frame, rgb_data_array=None):
+        """Synchronous CPU/GPU bound inference for Model A (Actual SCRFD)"""
+        if rgb_data_array is None:
+            return {"error": "No image data"}
+
+        start_time = time.time()
+        
+        # insightface expects BGR format (OpenCV standard)
+        bgr_data = cv2.cvtColor(rgb_data_array, cv2.COLOR_RGB2BGR)
+        
+        # Run SCRFD
+        faces = self.face_app.get(bgr_data)
+        
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        bounding_boxes = []
+        for face in faces:
+            # bbox is naturally [x1, y1, x2, y2]
+            box = face.bbox.astype(int).tolist()
+            conf = float(face.det_score)
+            bounding_boxes.append([box[0], box[1], box[2], box[3], conf])
 
         return {
             "model": "SCRFD",
-            "faces_detected": 1,
-            "bounding_boxes": [[x1, y1, x2, y2, confidence]],
-            "simulated_time_ms": random.randint(10, 45)
+            "faces_detected": len(faces),
+            "bounding_boxes": bounding_boxes,
+            "inference_time_ms": elapsed_ms
         }
 
     def _inference_model_b(self, tensor_frame):
@@ -84,7 +99,7 @@ class PipelineManager:
         # 2. Run inference in parallel using thread pool
         # PyTorch generally releases the Global Interpreter Lock (GIL) 
         # so threading works well for concurrent ML tasks here.
-        task_a = loop.run_in_executor(self.executor, self._inference_model_a, tensor_frame)
+        task_a = loop.run_in_executor(self.executor, self._inference_model_a, tensor_frame, rgb_data_array)
         task_b = loop.run_in_executor(self.executor, self._inference_model_b, tensor_frame)
         
         results = await asyncio.gather(task_a, task_b)

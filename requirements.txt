@@ -6,3 +6,6 @@ aiohttp
 pillow
 numpy
 python-dotenv
+insightface
+onnxruntime
+opencv-python
