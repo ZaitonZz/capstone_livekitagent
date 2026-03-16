@@ -183,6 +183,11 @@ async def entrypoint(ctx: JobContext):
     """Entrypoint function called whenever a new session/room connects to this agent."""
     logger.info(f"Connected to room: {ctx.room.name}")
     
+    # Initialize the heavy ML models inside the actual job to prevent prewarm timeouts
+    global pipeline
+    if pipeline is None:
+        pipeline = PipelineManager()
+    
     # Tell the room we only care about video tracks
     await ctx.connect(auto_subscribe=AutoSubscribe.VIDEO_ONLY)
 
@@ -198,9 +203,9 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm,
         )
     )
