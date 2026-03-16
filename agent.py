@@ -148,10 +148,17 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext):
             # and slice off Alpha to just get RGB
             rgb_data = frame_data.reshape((argb_frame.height, argb_frame.width, 4))[:, :, 1:]
             
-            # Encode image as base64 JPEG for verification UI
+            # Encode image as base64 JPEG for verification UI (Downsampled heavily for bandwidth)
             img = Image.fromarray(rgb_data, 'RGB')
+            # Resize image to something very small just for verification (e.g. 320px width)
+            # This ensures the base64 string doesn't breach PHP/Laravel cache size limits
+            aspect_ratio = img.height / img.width
+            new_width = 320
+            new_height = int(new_width * aspect_ratio)
+            img_resized = img.resize((new_width, new_height))
+            
             buffered = io.BytesIO()
-            img.save(buffered, format="JPEG", quality=60)
+            img_resized.save(buffered, format="JPEG", quality=40)
             img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
             image_data_uri = f"data:image/jpeg;base64,{img_b64}"
             
