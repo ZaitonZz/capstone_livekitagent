@@ -202,5 +202,6 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
+            memory_warn_mb=1024,
         )
     )

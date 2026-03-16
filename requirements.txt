@@ -8,4 +8,4 @@ numpy
 python-dotenv
 insightface
 onnxruntime
-opencv-python
+opencv-python-headless
