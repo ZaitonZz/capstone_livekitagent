@@ -128,12 +128,15 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext):
     video_stream = rtc.VideoStream(track)
     last_post_time = 0
     
+    import os
+    os.makedirs("saved_frames", exist_ok=True)
+    
     # Maintain a session for repeated HTTP requests to the backend
     async with aiohttp.ClientSession() as http_session:
         async for event in video_stream:
             current_time = time.time()
-            # Throttle to 1 update per second to avoid overloading Laravel backend
-            if current_time - last_post_time < 1.0:
+            # Throttle to 5 updates per second to avoid spamming the disk/backend
+            if current_time - last_post_time < 5.0:
                 continue
             last_post_time = current_time
 
@@ -148,30 +151,30 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext):
             # and slice off Alpha to just get RGB
             rgb_data = frame_data.reshape((argb_frame.height, argb_frame.width, 4))[:, :, 1:]
             
-            # Encode image as base64 JPEG for verification UI (Downsampled heavily for bandwidth)
-            img = Image.fromarray(rgb_data, 'RGB')
-            # Resize image to something very small just for verification (e.g. 320px width)
-            # This ensures the base64 string doesn't breach PHP/Laravel cache size limits
-            aspect_ratio = img.height / img.width
-            new_width = 320
-            new_height = int(new_width * aspect_ratio)
-            img_resized = img.resize((new_width, new_height))
-            
-            buffered = io.BytesIO()
-            img_resized.save(buffered, format="JPEG", quality=40)
-            img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-            image_data_uri = f"data:image/jpeg;base64,{img_b64}"
-            
             # Run the parallel pipeline over the frame
             inference_results = await pipeline.run_parallel_inference(rgb_data)
             
-            # Prepare payload for Laravel
+            # Save the frame to disk with bounding boxes drawn on it
+            bgr_frame = cv2.cvtColor(rgb_data, cv2.COLOR_RGB2BGR)
+            model_a_results = inference_results.get("model_A", {})
+            boxes = model_a_results.get("bounding_boxes", [])
+            for box in boxes:
+                # [x1, y1, x2, y2, confidence]
+                x1, y1, x2, y2, conf = int(box[0]), int(box[1]), int(box[2]), int(box[3]), box[4]
+                cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(bgr_frame, f"{conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            
+            frame_filename = f"saved_frames/latest_frame.jpg"
+            cv2.imwrite(frame_filename, bgr_frame)
+            logger.info(f"Saved latest frame to {frame_filename}")
+            
+            # Prepare payload for Laravel (without the heavy base64 image)
             payload = {
                 "track_id": track.sid,
                 "timestamp": event.timestamp_us,
                 "width": argb_frame.width,
                 "height": argb_frame.height,
-                "image": image_data_uri,
+                "image": None,
                 "ml_results": inference_results
             }
             
