@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any
 from urllib.parse import urljoin
@@ -249,6 +250,19 @@ class PipelineManager:
 
 
 pipeline: PipelineManager | None = None
+_pipeline_init_lock = threading.Lock()
+
+
+def get_or_create_pipeline() -> PipelineManager:
+    global pipeline
+
+    if pipeline is None:
+        with _pipeline_init_lock:
+            if pipeline is None:
+                logger.info("Lazy-loading InsightFace models on first video track...")
+                pipeline = PipelineManager()
+
+    return pipeline
 
 
 async def post_internal_json(session: aiohttp.ClientSession, url: str, payload: dict[str, Any]) -> bool:
@@ -282,13 +296,14 @@ async def send_face_match_result(session: aiohttp.ClientSession, payload: dict[s
 async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> None:
     logger.info("Video track subscribed: %s", track.sid)
 
+    active_pipeline = get_or_create_pipeline()
     video_stream = rtc.VideoStream(track)
     last_post_time = 0.0
     os.makedirs(SAVED_FRAMES_DIR, exist_ok=True)
 
     async with aiohttp.ClientSession() as http_session:
         gallery = FaceGallery()
-        await gallery.load_for_room(ctx.room.name, http_session, pipeline)
+        await gallery.load_for_room(ctx.room.name, http_session, active_pipeline)
 
         async for event in video_stream:
             current_time = time.time()
@@ -302,7 +317,7 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> N
             frame_data = np.frombuffer(argb_frame.data, dtype=np.uint8)
             rgb_data = frame_data.reshape((argb_frame.height, argb_frame.width, 4))[:, :, 1:]
 
-            inference_results = await pipeline.run_inference(rgb_data, gallery)
+            inference_results = await active_pipeline.run_inference(rgb_data, gallery)
 
             bgr_frame = cv2.cvtColor(rgb_data, cv2.COLOR_RGB2BGR)
             detection_results = inference_results.get("model_A", {})
@@ -358,18 +373,12 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> N
 
 
 def prewarm(process: JobProcess) -> None:
-    global pipeline
     logging.basicConfig(level=logging.INFO)
-    logger.info("Initializing agent and loading InsightFace models...")
-    pipeline = PipelineManager()
+    logger.info("Prewarm complete. Models will be loaded lazily on first track.")
 
 
 async def entrypoint(ctx: JobContext) -> None:
     logger.info("Connected to room: %s", ctx.room.name)
-
-    global pipeline
-    if pipeline is None:
-        pipeline = PipelineManager()
 
     await ctx.connect(auto_subscribe=AutoSubscribe.VIDEO_ONLY)
 
