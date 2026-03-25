@@ -11,12 +11,9 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
-import cv2
 import numpy as np
-import torch
 from dotenv import load_dotenv
 from face_recognition import FaceGallery as BaseFaceGallery, cosine_similarity, normalize_embedding
-from insightface.app import FaceAnalysis
 from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, JobProcess, WorkerOptions, cli
 
@@ -135,6 +132,9 @@ class FaceGallery(BaseFaceGallery):
 
 class PipelineManager:
     def __init__(self):
+        import torch
+        from insightface.app import FaceAnalysis
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("Using compute device: %s", self.device)
 
@@ -166,6 +166,8 @@ class PipelineManager:
         patient_name: str | None,
         threshold: float,
     ) -> dict[str, Any]:
+        import cv2
+
         start_time = time.time()
         bgr_data = cv2.cvtColor(rgb_data_array, cv2.COLOR_RGB2BGR)
         faces = self.face_app.get(bgr_data)
@@ -229,6 +231,8 @@ class PipelineManager:
         session: aiohttp.ClientSession,
         photo_url: str,
     ) -> np.ndarray | None:
+        import cv2
+
         resolved_url = resolve_asset_url(photo_url)
 
         try:
@@ -297,6 +301,8 @@ async def send_face_match_result(session: aiohttp.ClientSession, payload: dict[s
 
 
 async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> None:
+    import cv2
+
     logger.info("Video track subscribed: %s", track.sid)
 
     active_pipeline = get_or_create_pipeline()
@@ -403,5 +409,6 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
+            initialize_process_timeout=60.0,
         )
     )
