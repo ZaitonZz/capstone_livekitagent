@@ -33,6 +33,8 @@ FRAME_ANALYSIS_INTERVAL_SECONDS = float(os.getenv("FRAME_ANALYSIS_INTERVAL_SECON
 FACE_MATCH_STREAK_TARGET = int(os.getenv("FACE_MATCH_STREAK_TARGET", "3"))
 SAVED_FRAMES_DIR = os.getenv("SAVED_FRAMES_DIR", "saved_frames")
 REPORT_MISSING_REFERENCE_AS_FLAG = os.getenv("REPORT_MISSING_REFERENCE_AS_FLAG", "true").lower() == "true"
+VERIFICATION_TARGET = os.getenv("VERIFICATION_TARGET", "both").strip().lower()
+PARTICIPANT_AWARE_VERIFICATION = os.getenv("PARTICIPANT_AWARE_VERIFICATION", "true").strip().lower() == "true"
 
 
 def build_pipeline_signature_headers(body: str = "") -> dict[str, str]:
@@ -173,8 +175,8 @@ class FaceGallery(BaseFaceGallery):
             logger.error("Failed to fetch patient face data for room %s: %s", room_name, error)
             return False
 
-        self.patient_id = payload.get("patient_id")
-        self.patient_name = payload.get("patient_name")
+        self.patient_id = payload.get("patient_id") or payload.get("subject_user_id")
+        self.patient_name = payload.get("patient_name") or payload.get("subject_name")
         self.patient_photo_id = payload.get("photo_id")
         self.patient_reference_embedding = normalize_embedding(payload.get("face_embedding"))
 
@@ -229,7 +231,7 @@ class FaceGallery(BaseFaceGallery):
         """Load doctor face reference embedding from Laravel endpoint."""
         try:
             async with session.get(
-                build_internal_url(f"consultation/{room_name}/doctor-face"),
+                build_internal_url(f"consultation/{room_name}/patient-face?role=doctor"),
                 headers=build_pipeline_signature_headers(""),
             ) as response:
                 if response.status == 404:
@@ -249,8 +251,8 @@ class FaceGallery(BaseFaceGallery):
             logger.error("Failed to fetch doctor face data for room %s: %s", room_name, error)
             return False
 
-        self.doctor_id = payload.get("doctor_id")
-        self.doctor_name = payload.get("doctor_name")
+        self.doctor_id = payload.get("doctor_id") or payload.get("subject_user_id")
+        self.doctor_name = payload.get("doctor_name") or payload.get("subject_name")
         self.doctor_photo_id = payload.get("photo_id")
         self.doctor_reference_embedding = normalize_embedding(payload.get("face_embedding"))
 
@@ -285,7 +287,7 @@ class FaceGallery(BaseFaceGallery):
 
         stored = await post_internal_json(
             session,
-            build_internal_url(f"face-embeddings/{self.doctor_photo_id}"),
+            build_internal_url(f"face-embeddings/doctor/{self.doctor_photo_id}"),
             {"embedding": computed_embedding.astype(np.float32).tolist()},
         )
         if not stored:
@@ -319,13 +321,51 @@ class FaceGallery(BaseFaceGallery):
         except Exception as error:
             logger.error("Failed to fetch consultation ID: %s", error)
 
-        # Load patient reference
-        patient_loaded = await self._load_patient_reference(room_name, session, pipeline_manager)
+        target = VERIFICATION_TARGET if VERIFICATION_TARGET in {"patient", "doctor", "both"} else "both"
+        logger.info("Face verification target mode: %s", target)
 
-        # Load doctor reference (optional, doesn't fail if not found)
-        doctor_loaded = await self._load_doctor_reference(room_name, session, pipeline_manager)
+        patient_loaded = False
+        doctor_loaded = False
+
+        if target in {"patient", "both"}:
+            patient_loaded = await self._load_patient_reference(room_name, session, pipeline_manager)
+
+        if target in {"doctor", "both"}:
+            doctor_loaded = await self._load_doctor_reference(room_name, session, pipeline_manager)
 
         return patient_loaded or doctor_loaded
+
+    def resolve_track_subject_role(self, participant: rtc.RemoteParticipant | None) -> str | None:
+        if participant is None:
+            return None
+
+        metadata_raw = getattr(participant, "metadata", None)
+        if isinstance(metadata_raw, str) and metadata_raw.strip() != "":
+            try:
+                metadata = json.loads(metadata_raw)
+                role_from_metadata = str(metadata.get("role", "")).strip().lower()
+                if role_from_metadata in {"doctor", "patient"}:
+                    return role_from_metadata
+            except json.JSONDecodeError:
+                logger.debug("Unable to decode participant metadata JSON for participant %s", getattr(participant, "identity", "unknown"))
+
+        identity = str(getattr(participant, "identity", "")).strip().lower()
+        user_id: int | None = None
+
+        if identity.startswith("user-"):
+            user_id_str = identity.removeprefix("user-")
+            if user_id_str.isdigit():
+                user_id = int(user_id_str)
+        elif identity.isdigit():
+            user_id = int(identity)
+
+        if user_id is not None:
+            if self.patient_id is not None and user_id == self.patient_id:
+                return "patient"
+            if self.doctor_id is not None and user_id == self.doctor_id:
+                return "doctor"
+
+        return None
 
 
 class PipelineManager:
@@ -366,6 +406,7 @@ class PipelineManager:
         doctor_id: int | None,
         doctor_name: str | None,
         threshold: float,
+        target_role: str | None,
     ) -> dict[str, Any]:
         import cv2
 
@@ -378,6 +419,9 @@ class PipelineManager:
         best_patient_candidate: dict[str, Any] | None = None
         best_doctor_candidate: dict[str, Any] | None = None
 
+        check_patient = target_role in (None, "patient", "both")
+        check_doctor = target_role in (None, "doctor", "both")
+
         for face in faces:
             box = face.bbox.astype(int).tolist()
             confidence = float(face.det_score)
@@ -386,7 +430,7 @@ class PipelineManager:
             current_embedding = normalize_embedding(getattr(face, "embedding", None))
 
             # Check against patient reference
-            if patient_embedding is not None:
+            if check_patient and patient_embedding is not None:
                 patient_similarity = cosine_similarity(current_embedding, patient_embedding)
                 if patient_similarity is not None:
                     candidate = {
@@ -398,7 +442,7 @@ class PipelineManager:
                         best_patient_candidate = candidate
 
             # Check against doctor reference
-            if doctor_embedding is not None:
+            if check_doctor and doctor_embedding is not None:
                 doctor_similarity = cosine_similarity(current_embedding, doctor_embedding)
                 if doctor_similarity is not None:
                     candidate = {
@@ -420,7 +464,7 @@ class PipelineManager:
                 "model": "ArcFace",
                 "patient_id": patient_id,
                 "patient_name": patient_name,
-                "reference_loaded": patient_embedding is not None,
+                "reference_loaded": check_patient and patient_embedding is not None,
                 "faces_checked": len(faces),
                 "matched": None if best_patient_candidate is None else best_patient_candidate["matched"],
                 "best_similarity": None if best_patient_candidate is None else round(float(best_patient_candidate["similarity"]), 4),
@@ -430,7 +474,7 @@ class PipelineManager:
                 "model": "ArcFace",
                 "doctor_id": doctor_id,
                 "doctor_name": doctor_name,
-                "reference_loaded": doctor_embedding is not None,
+                "reference_loaded": check_doctor and doctor_embedding is not None,
                 "faces_checked": len(faces),
                 "matched": None if best_doctor_candidate is None else best_doctor_candidate["matched"],
                 "best_similarity": None if best_doctor_candidate is None else round(float(best_doctor_candidate["similarity"]), 4),
@@ -438,7 +482,12 @@ class PipelineManager:
             },
         }
 
-    async def run_inference(self, rgb_data_array: np.ndarray, gallery: FaceGallery) -> dict[str, Any]:
+    async def run_inference(
+        self,
+        rgb_data_array: np.ndarray,
+        gallery: FaceGallery,
+        target_role: str | None = None,
+    ) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self.executor,
@@ -451,6 +500,7 @@ class PipelineManager:
             gallery.doctor_id,
             gallery.doctor_name,
             gallery.threshold,
+            target_role,
         )
 
     async def compute_reference_embedding_from_url(
@@ -527,7 +577,11 @@ async def send_face_match_result(session: aiohttp.ClientSession, payload: dict[s
     await post_internal_json(session, build_internal_url("face-match-results"), payload)
 
 
-async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> None:
+async def video_track_handler(
+    track: rtc.RemoteVideoTrack,
+    participant: rtc.RemoteParticipant | None,
+    ctx: JobContext,
+) -> None:
     import cv2
 
     logger.info("Video track subscribed: %s", track.sid)
@@ -541,6 +595,28 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> N
         gallery = FaceGallery()
         await gallery.load_for_room(ctx.room.name, http_session, active_pipeline)
 
+        participant_identity = str(getattr(participant, "identity", "unknown"))
+        inferred_role = gallery.resolve_track_subject_role(participant)
+        configured_target = VERIFICATION_TARGET if VERIFICATION_TARGET in {"patient", "doctor", "both"} else "both"
+        target_role: str | None
+
+        if PARTICIPANT_AWARE_VERIFICATION and inferred_role in {"patient", "doctor"}:
+            target_role = inferred_role
+            logger.info(
+                "Participant-aware verification: identity=%s inferred_role=%s",
+                participant_identity,
+                inferred_role,
+            )
+        else:
+            target_role = configured_target
+            logger.info(
+                "Fallback verification target: identity=%s target=%s participant_aware=%s inferred_role=%s",
+                participant_identity,
+                configured_target,
+                PARTICIPANT_AWARE_VERIFICATION,
+                inferred_role,
+            )
+
         async for event in video_stream:
             current_time = time.time()
             if current_time - last_post_time < FRAME_ANALYSIS_INTERVAL_SECONDS:
@@ -553,7 +629,7 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> N
             frame_data = np.frombuffer(argb_frame.data, dtype=np.uint8)
             rgb_data = frame_data.reshape((argb_frame.height, argb_frame.width, 4))[:, :, 1:]
 
-            inference_results = await active_pipeline.run_inference(rgb_data, gallery)
+            inference_results = await active_pipeline.run_inference(rgb_data, gallery, target_role=target_role)
 
             bgr_frame = cv2.cvtColor(rgb_data, cv2.COLOR_RGB2BGR)
             detection_results = inference_results.get("model_A", {})
@@ -625,12 +701,12 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> N
             asyncio.create_task(send_frame_results(http_session, frame_payload))
 
             # Send separate match reports for patient and doctor
-            if patient_results.get("reference_loaded"):
+            if target_role in (None, "patient", "both") and patient_results.get("reference_loaded"):
                 patient_report = gallery.build_match_report(patient_results, role="patient")
                 if patient_report is not None:
                     asyncio.create_task(send_face_match_result(http_session, patient_report))
 
-            if doctor_results.get("reference_loaded"):
+            if target_role in (None, "doctor", "both") and doctor_results.get("reference_loaded"):
                 doctor_report = gallery.build_match_report(doctor_results, role="doctor")
                 if doctor_report is not None:
                     asyncio.create_task(send_face_match_result(http_session, doctor_report))
@@ -653,7 +729,7 @@ async def entrypoint(ctx: JobContext) -> None:
         participant: rtc.RemoteParticipant,
     ) -> None:
         if track.kind == rtc.TrackKind.KIND_VIDEO:
-            asyncio.create_task(video_track_handler(track, ctx))
+            asyncio.create_task(video_track_handler(track, participant, ctx))
 
     await asyncio.Future()
 
