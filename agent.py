@@ -452,7 +452,6 @@ class PipelineManager:
             gallery.doctor_name,
             gallery.threshold,
         )
-        )
 
     async def compute_reference_embedding_from_url(
         self,
