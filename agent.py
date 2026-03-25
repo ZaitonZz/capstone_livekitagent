@@ -109,7 +109,10 @@ class FaceGallery(BaseFaceGallery):
 
         photo_url = payload.get("photo_url")
         if photo_url is None or self.photo_id is None:
-            logger.warning("Patient %s has no primary photo available for ArcFace enrollment", self.patient_id)
+            logger.warning(
+                "Patient %s has no usable photo from Laravel (primary/fallback) for ArcFace enrollment",
+                self.patient_id,
+            )
             return False
 
         computed_embedding = await pipeline_manager.compute_reference_embedding_from_url(session, photo_url)
