@@ -32,6 +32,7 @@ FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.4"))
 FRAME_ANALYSIS_INTERVAL_SECONDS = float(os.getenv("FRAME_ANALYSIS_INTERVAL_SECONDS", "5.0"))
 FACE_MATCH_STREAK_TARGET = int(os.getenv("FACE_MATCH_STREAK_TARGET", "3"))
 SAVED_FRAMES_DIR = os.getenv("SAVED_FRAMES_DIR", "saved_frames")
+REPORT_MISSING_REFERENCE_AS_FLAG = os.getenv("REPORT_MISSING_REFERENCE_AS_FLAG", "true").lower() == "true"
 
 
 def build_pipeline_signature_headers(body: str = "") -> dict[str, str]:
@@ -65,6 +66,37 @@ class FaceGallery(BaseFaceGallery):
         confirmation_streak: int = FACE_MATCH_STREAK_TARGET,
     ):
         super().__init__(threshold=threshold, confirmation_streak=confirmation_streak)
+        self._missing_reference_reported = False
+
+    async def _report_missing_reference(self, session: aiohttp.ClientSession) -> None:
+        if not REPORT_MISSING_REFERENCE_AS_FLAG:
+            return
+
+        if self._missing_reference_reported:
+            return
+
+        if self.consultation_id is None:
+            return
+
+        payload = {
+            "consultation_id": self.consultation_id,
+            "matched": False,
+            "face_match_score": 0.0,
+            "flagged": True,
+        }
+
+        stored = await post_internal_json(
+            session,
+            build_internal_url("face-match-results"),
+            payload,
+        )
+
+        if stored:
+            self._missing_reference_reported = True
+            logger.warning(
+                "Reported missing-reference verification for consultation %s",
+                self.consultation_id,
+            )
 
     async def load_for_room(
         self,
@@ -100,6 +132,15 @@ class FaceGallery(BaseFaceGallery):
         self.photo_id = payload.get("photo_id")
         self.reference_embedding = normalize_embedding(payload.get("face_embedding"))
 
+        logger.info(
+            "Patient-face payload: consultation_id=%s patient_id=%s photo_id=%s has_embedding=%s used_fallback_photo=%s",
+            self.consultation_id,
+            self.patient_id,
+            self.photo_id,
+            self.reference_embedding is not None,
+            payload.get("used_fallback_photo"),
+        )
+
         if self.reference_embedding is not None:
             logger.info("Loaded stored ArcFace embedding for patient %s", self.patient_id)
             return True
@@ -110,11 +151,13 @@ class FaceGallery(BaseFaceGallery):
                 "Patient %s has no usable photo from Laravel (primary/fallback) for ArcFace enrollment",
                 self.patient_id,
             )
+            await self._report_missing_reference(session)
             return False
 
         computed_embedding = await pipeline_manager.compute_reference_embedding_from_url(session, photo_url)
         if computed_embedding is None:
             logger.warning("Unable to compute ArcFace embedding for patient photo %s", self.photo_id)
+            await self._report_missing_reference(session)
             return False
 
         stored = await post_internal_json(
@@ -123,6 +166,7 @@ class FaceGallery(BaseFaceGallery):
             {"embedding": computed_embedding.astype(np.float32).tolist()},
         )
         if not stored:
+            await self._report_missing_reference(session)
             return False
 
         self.reference_embedding = normalize_embedding(computed_embedding)
