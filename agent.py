@@ -94,9 +94,13 @@ class FaceGallery(BaseFaceGallery):
         if self.consultation_id is None:
             return
 
+        if self.patient_id is None:
+            return
+
         payload = {
             "consultation_id": self.consultation_id,
-            "role": "patient",
+            "user_id": self.patient_id,
+            "verified_role": "patient",
             "matched": False,
             "face_match_score": 0.0,
             "flagged": True,
@@ -125,9 +129,13 @@ class FaceGallery(BaseFaceGallery):
         if self.consultation_id is None:
             return
 
+        if self.doctor_id is None:
+            return
+
         payload = {
             "consultation_id": self.consultation_id,
-            "role": "doctor",
+            "user_id": self.doctor_id,
+            "verified_role": "doctor",
             "matched": False,
             "face_match_score": 0.0,
             "flagged": True,
@@ -550,12 +558,18 @@ def get_or_create_pipeline() -> PipelineManager:
 
 
 async def post_internal_json(session: aiohttp.ClientSession, url: str, payload: dict[str, Any]) -> bool:
-    body = json.dumps(payload)
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
     try:
-        async with session.post(url, data=body, headers=build_pipeline_signature_headers(body)) as response:
+        async with session.post(url, data=body.encode("utf-8"), headers=build_pipeline_signature_headers(body)) as response:
             if response.status not in (200, 201):
-                logger.warning("Internal pipeline endpoint %s returned HTTP %s", url, response.status)
+                response_text = await response.text()
+                logger.warning(
+                    "Internal pipeline endpoint %s returned HTTP %s body=%s",
+                    url,
+                    response.status,
+                    response_text[:500],
+                )
                 return False
 
             return True

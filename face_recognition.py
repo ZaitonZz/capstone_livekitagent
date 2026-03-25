@@ -92,9 +92,14 @@ class FaceGallery:
 
             self._patient_reported_decision = decision
 
+        user_id = self.doctor_id if role == "doctor" else self.patient_id
+        if user_id is None:
+            return None
+
         return {
             "consultation_id": self.consultation_id,
-            "role": role,
+            "user_id": user_id,
+            "verified_role": role,
             "matched": decision,
             "face_match_score": round(float(similarity), 4),
             "flagged": not decision,
