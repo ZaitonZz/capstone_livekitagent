@@ -145,8 +145,8 @@ class FaceGallery(BaseFaceGallery):
             logger.info("Loaded stored ArcFace embedding for patient %s", self.patient_id)
             return True
 
-        photo_url = payload.get("photo_url")
-        if photo_url is None or self.photo_id is None:
+        photo_path = payload.get("photo_path")
+        if photo_path is None or self.photo_id is None:
             logger.warning(
                 "Patient %s has no usable photo from Laravel (primary/fallback) for ArcFace enrollment",
                 self.patient_id,
@@ -154,6 +154,7 @@ class FaceGallery(BaseFaceGallery):
             await self._report_missing_reference(session)
             return False
 
+        photo_url = f"{LARAVEL_BASE_URL}{photo_path}"
         computed_embedding = await pipeline_manager.compute_reference_embedding_from_url(session, photo_url)
         if computed_embedding is None:
             logger.warning("Unable to compute ArcFace embedding for patient photo %s", self.photo_id)
