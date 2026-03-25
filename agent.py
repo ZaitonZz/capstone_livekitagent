@@ -66,13 +66,27 @@ class FaceGallery(BaseFaceGallery):
         confirmation_streak: int = FACE_MATCH_STREAK_TARGET,
     ):
         super().__init__(threshold=threshold, confirmation_streak=confirmation_streak)
-        self._missing_reference_reported = False
+        self.consultation_id: int | None = None
 
-    async def _report_missing_reference(self, session: aiohttp.ClientSession) -> None:
+        # Patient attributes
+        self.patient_id: int | None = None
+        self.patient_name: str | None = None
+        self.patient_photo_id: int | None = None
+        self.patient_reference_embedding: np.ndarray | None = None
+        self._patient_missing_reference_reported = False
+
+        # Doctor attributes
+        self.doctor_id: int | None = None
+        self.doctor_name: str | None = None
+        self.doctor_photo_id: int | None = None
+        self.doctor_reference_embedding: np.ndarray | None = None
+        self._doctor_missing_reference_reported = False
+
+    async def _report_missing_patient_reference(self, session: aiohttp.ClientSession) -> None:
         if not REPORT_MISSING_REFERENCE_AS_FLAG:
             return
 
-        if self._missing_reference_reported:
+        if self._patient_missing_reference_reported:
             return
 
         if self.consultation_id is None:
@@ -80,6 +94,7 @@ class FaceGallery(BaseFaceGallery):
 
         payload = {
             "consultation_id": self.consultation_id,
+            "role": "patient",
             "matched": False,
             "face_match_score": 0.0,
             "flagged": True,
@@ -92,25 +107,57 @@ class FaceGallery(BaseFaceGallery):
         )
 
         if stored:
-            self._missing_reference_reported = True
+            self._patient_missing_reference_reported = True
             logger.warning(
-                "Reported missing-reference verification for consultation %s",
+                "Reported missing patient reference for consultation %s",
                 self.consultation_id,
             )
 
-    async def load_for_room(
+    async def _report_missing_doctor_reference(self, session: aiohttp.ClientSession) -> None:
+        if not REPORT_MISSING_REFERENCE_AS_FLAG:
+            return
+
+        if self._doctor_missing_reference_reported:
+            return
+
+        if self.consultation_id is None:
+            return
+
+        payload = {
+            "consultation_id": self.consultation_id,
+            "role": "doctor",
+            "matched": False,
+            "face_match_score": 0.0,
+            "flagged": True,
+        }
+
+        stored = await post_internal_json(
+            session,
+            build_internal_url("face-match-results"),
+            payload,
+        )
+
+        if stored:
+            self._doctor_missing_reference_reported = True
+            logger.warning(
+                "Reported missing doctor reference for consultation %s",
+                self.consultation_id,
+            )
+
+    async def _load_patient_reference(
         self,
         room_name: str,
         session: aiohttp.ClientSession,
         pipeline_manager: "PipelineManager",
     ) -> bool:
+        """Load patient face reference embedding from Laravel endpoint."""
         try:
             async with session.get(
                 build_internal_url(f"consultation/{room_name}/patient-face"),
                 headers=build_pipeline_signature_headers(""),
             ) as response:
                 if response.status == 404:
-                    logger.warning("No consultation face data found for room %s", room_name)
+                    logger.warning("No patient face data found for room %s", room_name)
                     return False
 
                 if response.status != 200:
@@ -126,53 +173,159 @@ class FaceGallery(BaseFaceGallery):
             logger.error("Failed to fetch patient face data for room %s: %s", room_name, error)
             return False
 
-        self.consultation_id = payload.get("consultation_id")
         self.patient_id = payload.get("patient_id")
         self.patient_name = payload.get("patient_name")
-        self.photo_id = payload.get("photo_id")
-        self.reference_embedding = normalize_embedding(payload.get("face_embedding"))
+        self.patient_photo_id = payload.get("photo_id")
+        self.patient_reference_embedding = normalize_embedding(payload.get("face_embedding"))
 
         logger.info(
-            "Patient-face payload: consultation_id=%s patient_id=%s photo_id=%s has_embedding=%s used_fallback_photo=%s",
-            self.consultation_id,
+            "Patient-face payload: patient_id=%s patient_name=%s photo_id=%s has_embedding=%s used_fallback_photo=%s",
             self.patient_id,
-            self.photo_id,
-            self.reference_embedding is not None,
+            self.patient_name,
+            self.patient_photo_id,
+            self.patient_reference_embedding is not None,
             payload.get("used_fallback_photo"),
         )
 
-        if self.reference_embedding is not None:
+        if self.patient_reference_embedding is not None:
             logger.info("Loaded stored ArcFace embedding for patient %s", self.patient_id)
             return True
 
         photo_path = payload.get("photo_path")
-        if photo_path is None or self.photo_id is None:
+        if photo_path is None or self.patient_photo_id is None:
             logger.warning(
                 "Patient %s has no usable photo from Laravel (primary/fallback) for ArcFace enrollment",
                 self.patient_id,
             )
-            await self._report_missing_reference(session)
+            await self._report_missing_patient_reference(session)
             return False
 
         photo_url = f"{LARAVEL_BASE_URL}{photo_path}"
         computed_embedding = await pipeline_manager.compute_reference_embedding_from_url(session, photo_url)
         if computed_embedding is None:
-            logger.warning("Unable to compute ArcFace embedding for patient photo %s", self.photo_id)
-            await self._report_missing_reference(session)
+            logger.warning("Unable to compute ArcFace embedding for patient photo %s", self.patient_photo_id)
+            await self._report_missing_patient_reference(session)
             return False
 
         stored = await post_internal_json(
             session,
-            build_internal_url(f"face-embeddings/{self.photo_id}"),
+            build_internal_url(f"face-embeddings/{self.patient_photo_id}"),
             {"embedding": computed_embedding.astype(np.float32).tolist()},
         )
         if not stored:
-            await self._report_missing_reference(session)
+            await self._report_missing_patient_reference(session)
             return False
 
-        self.reference_embedding = normalize_embedding(computed_embedding)
-        logger.info("Computed and stored ArcFace embedding for patient photo %s", self.photo_id)
-        return self.reference_embedding is not None
+        self.patient_reference_embedding = normalize_embedding(computed_embedding)
+        logger.info("Computed and stored ArcFace embedding for patient photo %s", self.patient_photo_id)
+        return self.patient_reference_embedding is not None
+
+    async def _load_doctor_reference(
+        self,
+        room_name: str,
+        session: aiohttp.ClientSession,
+        pipeline_manager: "PipelineManager",
+    ) -> bool:
+        """Load doctor face reference embedding from Laravel endpoint."""
+        try:
+            async with session.get(
+                build_internal_url(f"consultation/{room_name}/doctor-face"),
+                headers=build_pipeline_signature_headers(""),
+            ) as response:
+                if response.status == 404:
+                    logger.info("No doctor face data found for room %s", room_name)
+                    return False
+
+                if response.status != 200:
+                    logger.warning(
+                        "Failed to load doctor face data for room %s: HTTP %s",
+                        room_name,
+                        response.status,
+                    )
+                    return False
+
+                payload = await response.json()
+        except Exception as error:
+            logger.error("Failed to fetch doctor face data for room %s: %s", room_name, error)
+            return False
+
+        self.doctor_id = payload.get("doctor_id")
+        self.doctor_name = payload.get("doctor_name")
+        self.doctor_photo_id = payload.get("photo_id")
+        self.doctor_reference_embedding = normalize_embedding(payload.get("face_embedding"))
+
+        logger.info(
+            "Doctor-face payload: doctor_id=%s doctor_name=%s photo_id=%s has_embedding=%s used_fallback_photo=%s",
+            self.doctor_id,
+            self.doctor_name,
+            self.doctor_photo_id,
+            self.doctor_reference_embedding is not None,
+            payload.get("used_fallback_photo"),
+        )
+
+        if self.doctor_reference_embedding is not None:
+            logger.info("Loaded stored ArcFace embedding for doctor %s", self.doctor_id)
+            return True
+
+        photo_path = payload.get("photo_path")
+        if photo_path is None or self.doctor_photo_id is None:
+            logger.warning(
+                "Doctor %s has no usable photo from Laravel (primary/fallback) for ArcFace enrollment",
+                self.doctor_id,
+            )
+            await self._report_missing_doctor_reference(session)
+            return False
+
+        photo_url = f"{LARAVEL_BASE_URL}{photo_path}"
+        computed_embedding = await pipeline_manager.compute_reference_embedding_from_url(session, photo_url)
+        if computed_embedding is None:
+            logger.warning("Unable to compute ArcFace embedding for doctor photo %s", self.doctor_photo_id)
+            await self._report_missing_doctor_reference(session)
+            return False
+
+        stored = await post_internal_json(
+            session,
+            build_internal_url(f"face-embeddings/{self.doctor_photo_id}"),
+            {"embedding": computed_embedding.astype(np.float32).tolist()},
+        )
+        if not stored:
+            await self._report_missing_doctor_reference(session)
+            return False
+
+        self.doctor_reference_embedding = normalize_embedding(computed_embedding)
+        logger.info("Computed and stored ArcFace embedding for doctor photo %s", self.doctor_photo_id)
+        return self.doctor_reference_embedding is not None
+
+    async def load_for_room(
+        self,
+        room_name: str,
+        session: aiohttp.ClientSession,
+        pipeline_manager: "PipelineManager",
+    ) -> bool:
+        """Load both patient and doctor face references for the consultation room."""
+        self.consultation_id = None
+
+        try:
+            # First, get the consultation ID from patient endpoint (required)
+            async with session.get(
+                build_internal_url(f"consultation/{room_name}/patient-face"),
+                headers=build_pipeline_signature_headers(""),
+            ) as response:
+                if response.status == 200:
+                    payload = await response.json()
+                    self.consultation_id = payload.get("consultation_id")
+                elif response.status != 404:
+                    logger.warning("Failed to get consultation ID: HTTP %s", response.status)
+        except Exception as error:
+            logger.error("Failed to fetch consultation ID: %s", error)
+
+        # Load patient reference
+        patient_loaded = await self._load_patient_reference(room_name, session, pipeline_manager)
+
+        # Load doctor reference (optional, doesn't fail if not found)
+        doctor_loaded = await self._load_doctor_reference(room_name, session, pipeline_manager)
+
+        return patient_loaded or doctor_loaded
 
 
 class PipelineManager:
@@ -206,9 +359,12 @@ class PipelineManager:
     def _analyze_frame(
         self,
         rgb_data_array: np.ndarray,
-        reference_embedding: np.ndarray | None,
+        patient_embedding: np.ndarray | None,
         patient_id: int | None,
         patient_name: str | None,
+        doctor_embedding: np.ndarray | None,
+        doctor_id: int | None,
+        doctor_name: str | None,
         threshold: float,
     ) -> dict[str, Any]:
         import cv2
@@ -219,7 +375,8 @@ class PipelineManager:
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         bounding_boxes: list[list[float]] = []
-        best_candidate: dict[str, Any] | None = None
+        best_patient_candidate: dict[str, Any] | None = None
+        best_doctor_candidate: dict[str, Any] | None = None
 
         for face in faces:
             box = face.bbox.astype(int).tolist()
@@ -227,18 +384,30 @@ class PipelineManager:
             bounding_boxes.append([box[0], box[1], box[2], box[3], confidence])
 
             current_embedding = normalize_embedding(getattr(face, "embedding", None))
-            similarity = cosine_similarity(current_embedding, reference_embedding)
-            if similarity is None:
-                continue
 
-            candidate = {
-                "matched": similarity >= threshold,
-                "similarity": similarity,
-                "bounding_box": [box[0], box[1], box[2], box[3]],
-            }
+            # Check against patient reference
+            if patient_embedding is not None:
+                patient_similarity = cosine_similarity(current_embedding, patient_embedding)
+                if patient_similarity is not None:
+                    candidate = {
+                        "matched": patient_similarity >= threshold,
+                        "similarity": patient_similarity,
+                        "bounding_box": [box[0], box[1], box[2], box[3]],
+                    }
+                    if best_patient_candidate is None or candidate["similarity"] > best_patient_candidate["similarity"]:
+                        best_patient_candidate = candidate
 
-            if best_candidate is None or candidate["similarity"] > best_candidate["similarity"]:
-                best_candidate = candidate
+            # Check against doctor reference
+            if doctor_embedding is not None:
+                doctor_similarity = cosine_similarity(current_embedding, doctor_embedding)
+                if doctor_similarity is not None:
+                    candidate = {
+                        "matched": doctor_similarity >= threshold,
+                        "similarity": doctor_similarity,
+                        "bounding_box": [box[0], box[1], box[2], box[3]],
+                    }
+                    if best_doctor_candidate is None or candidate["similarity"] > best_doctor_candidate["similarity"]:
+                        best_doctor_candidate = candidate
 
         return {
             "model_A": {
@@ -247,15 +416,25 @@ class PipelineManager:
                 "bounding_boxes": bounding_boxes,
                 "inference_time_ms": elapsed_ms,
             },
-            "model_B": {
+            "patient": {
                 "model": "ArcFace",
                 "patient_id": patient_id,
                 "patient_name": patient_name,
-                "reference_loaded": reference_embedding is not None,
+                "reference_loaded": patient_embedding is not None,
                 "faces_checked": len(faces),
-                "matched": None if best_candidate is None else best_candidate["matched"],
-                "best_similarity": None if best_candidate is None else round(float(best_candidate["similarity"]), 4),
-                "best_box": None if best_candidate is None else best_candidate["bounding_box"],
+                "matched": None if best_patient_candidate is None else best_patient_candidate["matched"],
+                "best_similarity": None if best_patient_candidate is None else round(float(best_patient_candidate["similarity"]), 4),
+                "best_box": None if best_patient_candidate is None else best_patient_candidate["bounding_box"],
+            },
+            "doctor": {
+                "model": "ArcFace",
+                "doctor_id": doctor_id,
+                "doctor_name": doctor_name,
+                "reference_loaded": doctor_embedding is not None,
+                "faces_checked": len(faces),
+                "matched": None if best_doctor_candidate is None else best_doctor_candidate["matched"],
+                "best_similarity": None if best_doctor_candidate is None else round(float(best_doctor_candidate["similarity"]), 4),
+                "best_box": None if best_doctor_candidate is None else best_doctor_candidate["bounding_box"],
             },
         }
 
@@ -265,10 +444,14 @@ class PipelineManager:
             self.executor,
             self._analyze_frame,
             rgb_data_array,
-            gallery.reference_embedding,
+            gallery.patient_reference_embedding,
             gallery.patient_id,
             gallery.patient_name,
+            gallery.doctor_reference_embedding,
+            gallery.doctor_id,
+            gallery.doctor_name,
             gallery.threshold,
+        )
         )
 
     async def compute_reference_embedding_from_url(
@@ -375,8 +558,10 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> N
 
             bgr_frame = cv2.cvtColor(rgb_data, cv2.COLOR_RGB2BGR)
             detection_results = inference_results.get("model_A", {})
-            recognition_results = inference_results.get("model_B", {})
+            patient_results = inference_results.get("patient", {})
+            doctor_results = inference_results.get("doctor", {})
 
+            # Draw detection bounding boxes
             for box in detection_results.get("bounding_boxes", []):
                 x1, y1, x2, y2, confidence = int(box[0]), int(box[1]), int(box[2]), int(box[3]), float(box[4])
                 cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -390,19 +575,38 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> N
                     2,
                 )
 
-            if recognition_results.get("best_box") is not None:
-                x1, y1, x2, y2 = recognition_results["best_box"]
-                similarity = recognition_results.get("best_similarity")
-                matched = recognition_results.get("matched")
-                label = "match" if matched else "mismatch"
-                color = (0, 255, 0) if matched else (0, 0, 255)
-                cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), color, 2)
+            # Draw patient recognition box (blue for patient)
+            if patient_results.get("best_box") is not None:
+                x1, y1, x2, y2 = patient_results["best_box"]
+                similarity = patient_results.get("best_similarity")
+                matched = patient_results.get("matched")
+                label = f"patient-match {similarity}" if matched else f"patient-nomatch {similarity}"
+                color = (255, 0, 0) if matched else (0, 0, 255)  # Blue if match, Red if no match
+                cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), color, 3)
                 cv2.putText(
                     bgr_frame,
-                    f"{label} {similarity}",
-                    (x1, min(y2 + 25, argb_frame.height - 10)),
+                    label,
+                    (x1, max(y1 - 35, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
+                    0.6,
+                    color,
+                    2,
+                )
+
+            # Draw doctor recognition box (cyan for doctor)
+            if doctor_results.get("best_box") is not None:
+                x1, y1, x2, y2 = doctor_results["best_box"]
+                similarity = doctor_results.get("best_similarity")
+                matched = doctor_results.get("matched")
+                label = f"doctor-match {similarity}" if matched else f"doctor-nomatch {similarity}"
+                color = (255, 255, 0) if matched else (0, 165, 255)  # Cyan if match, Orange if no match
+                cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), color, 3)
+                cv2.putText(
+                    bgr_frame,
+                    label,
+                    (x1, min(y2 + 35, argb_frame.height - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
                     color,
                     2,
                 )
@@ -421,9 +625,16 @@ async def video_track_handler(track: rtc.RemoteVideoTrack, ctx: JobContext) -> N
             }
             asyncio.create_task(send_frame_results(http_session, frame_payload))
 
-            report_payload = gallery.build_match_report(recognition_results)
-            if report_payload is not None:
-                asyncio.create_task(send_face_match_result(http_session, report_payload))
+            # Send separate match reports for patient and doctor
+            if patient_results.get("reference_loaded"):
+                patient_report = gallery.build_match_report(patient_results, role="patient")
+                if patient_report is not None:
+                    asyncio.create_task(send_face_match_result(http_session, patient_report))
+
+            if doctor_results.get("reference_loaded"):
+                doctor_report = gallery.build_match_report(doctor_results, role="doctor")
+                if doctor_report is not None:
+                    asyncio.create_task(send_face_match_result(http_session, doctor_report))
 
 
 def prewarm(process: JobProcess) -> None:

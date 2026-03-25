@@ -37,11 +37,21 @@ class FaceGallery:
         self.patient_name: str | None = None
         self.photo_id: int | None = None
         self.reference_embedding: np.ndarray | None = None
-        self._last_decision: bool | None = None
-        self._decision_streak = 0
-        self._reported_decision: bool | None = None
+        
+        # Separate streak tracking for patient and doctor
+        self._patient_last_decision: bool | None = None
+        self._patient_decision_streak = 0
+        self._patient_reported_decision: bool | None = None
+        
+        self._doctor_last_decision: bool | None = None
+        self._doctor_decision_streak = 0
+        self._doctor_reported_decision: bool | None = None
 
-    def build_match_report(self, recognition_result: dict[str, Any]) -> dict[str, Any] | None:
+    def build_match_report(
+        self,
+        recognition_result: dict[str, Any],
+        role: str = "patient",
+    ) -> dict[str, Any] | None:
         if self.consultation_id is None:
             return None
 
@@ -51,22 +61,40 @@ class FaceGallery:
             return None
 
         decision = bool(matched)
-        if self._last_decision == decision:
-            self._decision_streak += 1
-        else:
-            self._last_decision = decision
-            self._decision_streak = 1
+        
+        # Use role-specific streak tracking
+        if role == "doctor":
+            if self._doctor_last_decision == decision:
+                self._doctor_decision_streak += 1
+            else:
+                self._doctor_last_decision = decision
+                self._doctor_decision_streak = 1
 
-        if self._decision_streak < self.confirmation_streak:
-            return None
+            if self._doctor_decision_streak < self.confirmation_streak:
+                return None
 
-        if self._reported_decision == decision:
-            return None
+            if self._doctor_reported_decision == decision:
+                return None
 
-        self._reported_decision = decision
+            self._doctor_reported_decision = decision
+        else:  # patient or default
+            if self._patient_last_decision == decision:
+                self._patient_decision_streak += 1
+            else:
+                self._patient_last_decision = decision
+                self._patient_decision_streak = 1
+
+            if self._patient_decision_streak < self.confirmation_streak:
+                return None
+
+            if self._patient_reported_decision == decision:
+                return None
+
+            self._patient_reported_decision = decision
 
         return {
             "consultation_id": self.consultation_id,
+            "role": role,
             "matched": decision,
             "face_match_score": round(float(similarity), 4),
             "flagged": not decision,
