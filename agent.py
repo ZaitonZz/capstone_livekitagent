@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -35,6 +36,15 @@ SAVED_FRAMES_DIR = os.getenv("SAVED_FRAMES_DIR", "saved_frames")
 REPORT_MISSING_REFERENCE_AS_FLAG = os.getenv("REPORT_MISSING_REFERENCE_AS_FLAG", "true").lower() == "true"
 VERIFICATION_TARGET = os.getenv("VERIFICATION_TARGET", "both").strip().lower()
 PARTICIPANT_AWARE_VERIFICATION = os.getenv("PARTICIPANT_AWARE_VERIFICATION", "true").strip().lower() == "true"
+DEEPFAKE_MODEL_PATH = os.getenv(
+    "DEEPFAKE_MODEL_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "df_detector_efficientnet_v2_s_best.pth"),
+)
+DEEPFAKE_MODEL_VERSION = os.getenv("DEEPFAKE_MODEL_VERSION", "efficientnet_v2_s")
+DEEPFAKE_INPUT_SIZE = int(os.getenv("DEEPFAKE_INPUT_SIZE", "384"))
+DEEPFAKE_FAKE_THRESHOLD = float(os.getenv("DEEPFAKE_FAKE_THRESHOLD", "0.5"))
+DEEPFAKE_INCONCLUSIVE_MARGIN = float(os.getenv("DEEPFAKE_INCONCLUSIVE_MARGIN", "0.05"))
+DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "1"))
 
 
 def build_pipeline_signature_headers(body: str = "") -> dict[str, str]:
@@ -59,6 +69,44 @@ def resolve_asset_url(url: str) -> str:
         return url
 
     return urljoin(f"{LARAVEL_BASE_URL}/", url.lstrip("/"))
+
+
+def determine_deepfake_result(fake_score: float) -> tuple[str, float]:
+    bounded_score = max(0.0, min(1.0, float(fake_score)))
+    if abs(bounded_score - DEEPFAKE_FAKE_THRESHOLD) <= DEEPFAKE_INCONCLUSIVE_MARGIN:
+        return "inconclusive", max(bounded_score, 1.0 - bounded_score)
+
+    if bounded_score >= DEEPFAKE_FAKE_THRESHOLD:
+        return "fake", bounded_score
+
+    return "real", 1.0 - bounded_score
+
+
+def build_saved_frame_filename(consultation_id: int | None, frame_number: int, timestamp_us: int) -> str:
+    consultation_fragment = str(consultation_id) if consultation_id is not None else "unknown"
+    return f"consultation-{consultation_fragment}_frame-{frame_number:06d}_{timestamp_us}.jpg"
+
+
+def build_scan_result_payload(
+    consultation_id: int,
+    deepfake_result: dict[str, Any],
+    frame_path: str,
+    frame_number: int,
+) -> dict[str, Any]:
+    result = str(deepfake_result.get("result", "inconclusive"))
+    confidence_score = round(float(deepfake_result.get("confidence_score", 0.0)), 4)
+    flagged = bool(deepfake_result.get("flagged", result == "fake"))
+
+    return {
+        "consultation_id": consultation_id,
+        "result": result,
+        "confidence_score": confidence_score,
+        "frame_path": frame_path,
+        "frame_number": frame_number,
+        "model_version": str(deepfake_result.get("model_version", DEEPFAKE_MODEL_VERSION)),
+        "flagged": flagged,
+        "scanned_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 class FaceGallery(BaseFaceGallery):
@@ -379,6 +427,7 @@ class FaceGallery(BaseFaceGallery):
 class PipelineManager:
     def __init__(self):
         import torch
+        import torchvision.models as tv_models
         from insightface.app import FaceAnalysis
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -390,7 +439,100 @@ class PipelineManager:
         self.face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
         logger.info("InsightFace loaded successfully.")
 
+        self.deepfake_model = tv_models.efficientnet_v2_s(weights=None)
+        classifier_input_features = self.deepfake_model.classifier[1].in_features
+        self.deepfake_model.classifier[1] = torch.nn.Linear(classifier_input_features, 1)
+
+        self.deepfake_model_loaded = False
+        if os.path.exists(DEEPFAKE_MODEL_PATH):
+            try:
+                checkpoint = torch.load(DEEPFAKE_MODEL_PATH, map_location=self.device)
+
+                if isinstance(checkpoint, dict):
+                    state_dict = checkpoint.get("state_dict", checkpoint)
+                else:
+                    state_dict = checkpoint
+
+                if isinstance(state_dict, dict):
+                    state_dict = {
+                        key.removeprefix("model.").removeprefix("module."): value
+                        for key, value in state_dict.items()
+                    }
+
+                self.deepfake_model.load_state_dict(state_dict, strict=False)
+                self.deepfake_model.to(self.device)
+                self.deepfake_model.eval()
+                self.deepfake_model_loaded = True
+                logger.info("Deepfake model loaded from %s", DEEPFAKE_MODEL_PATH)
+            except Exception as error:
+                logger.exception("Failed to load deepfake model from %s: %s", DEEPFAKE_MODEL_PATH, error)
+        else:
+            logger.warning("Deepfake model path does not exist: %s", DEEPFAKE_MODEL_PATH)
+
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+    def _infer_deepfake_from_frame(self, rgb_data_array: np.ndarray) -> dict[str, Any]:
+        import cv2
+        import torch
+
+        start_time = time.time()
+
+        if not self.deepfake_model_loaded:
+            return {
+                "model": "EfficientNetV2-S",
+                "model_version": DEEPFAKE_MODEL_VERSION,
+                "result": "inconclusive",
+                "fake_score": None,
+                "confidence_score": 0.0,
+                "flagged": False,
+                "inference_time_ms": int((time.time() - start_time) * 1000),
+            }
+
+        try:
+            resized_rgb = cv2.resize(rgb_data_array, (DEEPFAKE_INPUT_SIZE, DEEPFAKE_INPUT_SIZE), interpolation=cv2.INTER_AREA)
+            normalized = resized_rgb.astype(np.float32) / 255.0
+
+            tensor = torch.from_numpy(normalized).permute(2, 0, 1).unsqueeze(0)
+            mean = torch.tensor([0.485, 0.456, 0.406], dtype=tensor.dtype).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], dtype=tensor.dtype).view(1, 3, 1, 1)
+            tensor = (tensor - mean) / std
+            tensor = tensor.to(self.device)
+
+            with torch.no_grad():
+                logits = self.deepfake_model(tensor)
+
+            fake_score: float
+            flattened_logits = logits.flatten()
+
+            if flattened_logits.numel() == 1:
+                fake_score = float(torch.sigmoid(flattened_logits[0]).item())
+            else:
+                probabilities = torch.softmax(flattened_logits, dim=0)
+                target_index = DEEPFAKE_FAKE_CLASS_INDEX if DEEPFAKE_FAKE_CLASS_INDEX < probabilities.numel() else probabilities.numel() - 1
+                fake_score = float(probabilities[target_index].item())
+
+            result, confidence_score = determine_deepfake_result(fake_score)
+
+            return {
+                "model": "EfficientNetV2-S",
+                "model_version": DEEPFAKE_MODEL_VERSION,
+                "result": result,
+                "fake_score": round(fake_score, 4),
+                "confidence_score": round(confidence_score, 4),
+                "flagged": result == "fake",
+                "inference_time_ms": int((time.time() - start_time) * 1000),
+            }
+        except Exception as error:
+            logger.exception("Deepfake inference failed: %s", error)
+            return {
+                "model": "EfficientNetV2-S",
+                "model_version": DEEPFAKE_MODEL_VERSION,
+                "result": "inconclusive",
+                "fake_score": None,
+                "confidence_score": 0.0,
+                "flagged": False,
+                "inference_time_ms": int((time.time() - start_time) * 1000),
+            }
 
     def _extract_embedding_from_bgr(self, bgr_image: np.ndarray) -> np.ndarray | None:
         faces = self.face_app.get(bgr_image)
@@ -461,6 +603,8 @@ class PipelineManager:
                     if best_doctor_candidate is None or candidate["similarity"] > best_doctor_candidate["similarity"]:
                         best_doctor_candidate = candidate
 
+        deepfake_results = self._infer_deepfake_from_frame(rgb_data_array)
+
         return {
             "model_A": {
                 "model": "SCRFD",
@@ -488,6 +632,7 @@ class PipelineManager:
                 "best_similarity": None if best_doctor_candidate is None else round(float(best_doctor_candidate["similarity"]), 4),
                 "best_box": None if best_doctor_candidate is None else best_doctor_candidate["bounding_box"],
             },
+            "deepfake": deepfake_results,
         }
 
     async def run_inference(
@@ -591,6 +736,10 @@ async def send_face_match_result(session: aiohttp.ClientSession, payload: dict[s
     await post_internal_json(session, build_internal_url("face-match-results"), payload)
 
 
+async def send_scan_result(session: aiohttp.ClientSession, payload: dict[str, Any]) -> None:
+    await post_internal_json(session, build_internal_url("scan-results"), payload)
+
+
 async def video_track_handler(
     track: rtc.RemoteVideoTrack,
     participant: rtc.RemoteParticipant | None,
@@ -603,6 +752,7 @@ async def video_track_handler(
     active_pipeline = get_or_create_pipeline()
     video_stream = rtc.VideoStream(track)
     last_post_time = 0.0
+    analyzed_frame_number = 0
     os.makedirs(SAVED_FRAMES_DIR, exist_ok=True)
 
     async with aiohttp.ClientSession() as http_session:
@@ -637,6 +787,7 @@ async def video_track_handler(
                 continue
 
             last_post_time = current_time
+            analyzed_frame_number += 1
 
             rtc_frame = event.frame
             argb_frame = rtc_frame.convert(rtc.VideoBufferType.ARGB)
@@ -649,6 +800,7 @@ async def video_track_handler(
             detection_results = inference_results.get("model_A", {})
             patient_results = inference_results.get("patient", {})
             doctor_results = inference_results.get("doctor", {})
+            deepfake_results = inference_results.get("deepfake", {})
 
             # Draw detection bounding boxes
             for box in detection_results.get("bounding_boxes", []):
@@ -700,9 +852,12 @@ async def video_track_handler(
                     2,
                 )
 
-            frame_filename = os.path.join(SAVED_FRAMES_DIR, "latest_frame.jpg")
+            frame_filename = os.path.join(
+                SAVED_FRAMES_DIR,
+                build_saved_frame_filename(gallery.consultation_id, analyzed_frame_number, event.timestamp_us),
+            )
             cv2.imwrite(frame_filename, bgr_frame)
-            logger.info("Saved latest frame to %s", frame_filename)
+            logger.info("Saved analyzed frame to %s", frame_filename)
 
             frame_payload = {
                 "track_id": track.sid,
@@ -724,6 +879,15 @@ async def video_track_handler(
                 doctor_report = gallery.build_match_report(doctor_results, role="doctor")
                 if doctor_report is not None:
                     asyncio.create_task(send_face_match_result(http_session, doctor_report))
+
+            if gallery.consultation_id is not None and deepfake_results:
+                deepfake_scan_payload = build_scan_result_payload(
+                    consultation_id=gallery.consultation_id,
+                    deepfake_result=deepfake_results,
+                    frame_path=frame_filename,
+                    frame_number=analyzed_frame_number,
+                )
+                asyncio.create_task(send_scan_result(http_session, deepfake_scan_payload))
 
 
 def prewarm(process: JobProcess) -> None:
