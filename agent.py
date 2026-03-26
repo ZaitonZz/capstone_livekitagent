@@ -442,6 +442,78 @@ class FaceGallery(BaseFaceGallery):
 
 
 class PipelineManager:
+    def _looks_like_state_dict(self, value: Any) -> bool:
+        if hasattr(value, "state_dict") and callable(value.state_dict):
+            try:
+                return self._looks_like_state_dict(value.state_dict())
+            except Exception:
+                return False
+
+        if not isinstance(value, dict) or len(value) == 0:
+            return False
+
+        sample_keys = list(value.keys())[:20]
+        if not all(isinstance(key, str) for key in sample_keys):
+            return False
+
+        sample_values = list(value.values())[:20]
+        return any(hasattr(sample, "shape") for sample in sample_values)
+
+    def _extract_checkpoint_state_dict(self, checkpoint: Any) -> dict[str, Any]:
+        pending: list[Any] = [checkpoint]
+        visited: set[int] = set()
+
+        while pending:
+            current = pending.pop(0)
+            current_id = id(current)
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+
+            if hasattr(current, "state_dict") and callable(current.state_dict):
+                try:
+                    module_state = current.state_dict()
+                    if self._looks_like_state_dict(module_state):
+                        return module_state
+
+                    if isinstance(module_state, dict):
+                        pending.extend(module_state.values())
+                except Exception:
+                    pass
+
+            if isinstance(current, dict):
+                if self._looks_like_state_dict(current):
+                    return current
+
+                for candidate_key in ["state_dict", "model_state_dict", "model", "net", "network", "weights", "backbone"]:
+                    if candidate_key in current:
+                        pending.append(current[candidate_key])
+
+        return {}
+
+    def _normalize_checkpoint_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        prefixes = ["module.", "model.", "_orig_mod.", "net.", "network.", "backbone."]
+
+        for raw_key, value in state_dict.items():
+            key = raw_key
+            changed = True
+            while changed:
+                changed = False
+                for prefix in prefixes:
+                    if key.startswith(prefix):
+                        key = key[len(prefix):]
+                        changed = True
+
+            if key == "classifier.weight":
+                key = "classifier.1.weight"
+            elif key == "classifier.bias":
+                key = "classifier.1.bias"
+
+            normalized[key] = value
+
+        return normalized
+
     def __init__(self):
         import torch
         import torchvision.models as tv_models
@@ -466,16 +538,14 @@ class PipelineManager:
             try:
                 checkpoint = torch.load(DEEPFAKE_MODEL_PATH, map_location=self.device)
 
-                if isinstance(checkpoint, dict):
-                    state_dict = checkpoint.get("state_dict", checkpoint)
-                else:
-                    state_dict = checkpoint
+                state_dict = self._extract_checkpoint_state_dict(checkpoint)
+                state_dict = self._normalize_checkpoint_state_dict(state_dict)
 
-                if isinstance(state_dict, dict):
-                    state_dict = {
-                        key.removeprefix("model.").removeprefix("module."): value
-                        for key, value in state_dict.items()
-                    }
+                if not state_dict:
+                    logger.error("Deepfake checkpoint does not contain a usable state_dict: %s", DEEPFAKE_MODEL_PATH)
+                    self.deepfake_model_loaded = False
+                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+                    return
 
                 classifier_weight = state_dict.get("classifier.1.weight")
                 if classifier_weight is not None and getattr(classifier_weight, "ndim", 0) == 2:
@@ -492,16 +562,27 @@ class PipelineManager:
                 if unexpected_keys:
                     logger.warning("Deepfake model unexpected keys while loading: %s", unexpected_keys)
 
-                self.deepfake_model_loaded = len(missing_keys) == 0
+                model_state_keys = set(self.deepfake_model.state_dict().keys())
+                matched_keys = model_state_keys.intersection(state_dict.keys())
+                critical_keys_present = any(
+                    key.startswith("features.") or key.startswith("classifier.")
+                    for key in matched_keys
+                )
+
+                self.deepfake_model_loaded = critical_keys_present and len(matched_keys) >= 10
                 if self.deepfake_model_loaded:
                     logger.info(
-                        "Deepfake model loaded from %s with %s output class(es)",
+                        "Deepfake model loaded from %s with %s output class(es), matched_keys=%s/%s",
                         DEEPFAKE_MODEL_PATH,
                         self.deepfake_output_classes,
+                        len(matched_keys),
+                        len(model_state_keys),
                     )
                 else:
                     logger.error(
-                        "Deepfake model load incomplete; model will report inconclusive until checkpoint keys fully match",
+                        "Deepfake model load incomplete; matched_keys=%s/%s. Model will report inconclusive until key mapping is fixed",
+                        len(matched_keys),
+                        len(model_state_keys),
                     )
             except Exception as error:
                 logger.exception("Failed to load deepfake model from %s: %s", DEEPFAKE_MODEL_PATH, error)
