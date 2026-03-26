@@ -45,6 +45,7 @@ DEEPFAKE_INPUT_SIZE = int(os.getenv("DEEPFAKE_INPUT_SIZE", "384"))
 DEEPFAKE_FAKE_THRESHOLD = float(os.getenv("DEEPFAKE_FAKE_THRESHOLD", "0.5"))
 DEEPFAKE_INCONCLUSIVE_MARGIN = float(os.getenv("DEEPFAKE_INCONCLUSIVE_MARGIN", "0.05"))
 DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "1"))
+DEEPFAKE_REPORTING_ROLE = os.getenv("DEEPFAKE_REPORTING_ROLE", "patient").strip().lower()
 
 
 def build_pipeline_signature_headers(body: str = "") -> dict[str, str]:
@@ -82,9 +83,25 @@ def determine_deepfake_result(fake_score: float) -> tuple[str, float]:
     return "real", 1.0 - bounded_score
 
 
-def build_saved_frame_filename(consultation_id: int | None, frame_number: int, timestamp_us: int) -> str:
+def normalize_track_id(track_id: str) -> str:
+    safe = "".join(character if character.isalnum() else "-" for character in track_id.strip())
+    return safe.strip("-") or "unknown-track"
+
+
+def should_report_deepfake_for_role(inferred_role: str | None) -> bool:
+    if DEEPFAKE_REPORTING_ROLE == "both":
+        return True
+
+    if DEEPFAKE_REPORTING_ROLE in {"patient", "doctor"}:
+        return inferred_role == DEEPFAKE_REPORTING_ROLE
+
+    return True
+
+
+def build_saved_frame_filename(consultation_id: int | None, frame_number: int, timestamp_us: int, track_id: str) -> str:
     consultation_fragment = str(consultation_id) if consultation_id is not None else "unknown"
-    return f"consultation-{consultation_fragment}_frame-{frame_number:06d}_{timestamp_us}.jpg"
+    track_fragment = normalize_track_id(track_id)
+    return f"consultation-{consultation_fragment}_track-{track_fragment}_frame-{frame_number:06d}_{timestamp_us}.jpg"
 
 
 def build_scan_result_payload(
@@ -442,6 +459,7 @@ class PipelineManager:
         self.deepfake_model = tv_models.efficientnet_v2_s(weights=None)
         classifier_input_features = self.deepfake_model.classifier[1].in_features
         self.deepfake_model.classifier[1] = torch.nn.Linear(classifier_input_features, 1)
+        self.deepfake_output_classes = 1
 
         self.deepfake_model_loaded = False
         if os.path.exists(DEEPFAKE_MODEL_PATH):
@@ -459,11 +477,32 @@ class PipelineManager:
                         for key, value in state_dict.items()
                     }
 
-                self.deepfake_model.load_state_dict(state_dict, strict=False)
+                classifier_weight = state_dict.get("classifier.1.weight")
+                if classifier_weight is not None and getattr(classifier_weight, "ndim", 0) == 2:
+                    checkpoint_output_classes = int(classifier_weight.shape[0])
+                    if checkpoint_output_classes > 0 and checkpoint_output_classes != self.deepfake_output_classes:
+                        self.deepfake_model.classifier[1] = torch.nn.Linear(classifier_input_features, checkpoint_output_classes)
+                        self.deepfake_output_classes = checkpoint_output_classes
+
+                missing_keys, unexpected_keys = self.deepfake_model.load_state_dict(state_dict, strict=False)
                 self.deepfake_model.to(self.device)
                 self.deepfake_model.eval()
-                self.deepfake_model_loaded = True
-                logger.info("Deepfake model loaded from %s", DEEPFAKE_MODEL_PATH)
+                if missing_keys:
+                    logger.warning("Deepfake model missing keys while loading: %s", missing_keys)
+                if unexpected_keys:
+                    logger.warning("Deepfake model unexpected keys while loading: %s", unexpected_keys)
+
+                self.deepfake_model_loaded = len(missing_keys) == 0
+                if self.deepfake_model_loaded:
+                    logger.info(
+                        "Deepfake model loaded from %s with %s output class(es)",
+                        DEEPFAKE_MODEL_PATH,
+                        self.deepfake_output_classes,
+                    )
+                else:
+                    logger.error(
+                        "Deepfake model load incomplete; model will report inconclusive until checkpoint keys fully match",
+                    )
             except Exception as error:
                 logger.exception("Failed to load deepfake model from %s: %s", DEEPFAKE_MODEL_PATH, error)
         else:
@@ -504,7 +543,7 @@ class PipelineManager:
             fake_score: float
             flattened_logits = logits.flatten()
 
-            if flattened_logits.numel() == 1:
+            if self.deepfake_output_classes == 1 or flattened_logits.numel() == 1:
                 fake_score = float(torch.sigmoid(flattened_logits[0]).item())
             else:
                 probabilities = torch.softmax(flattened_logits, dim=0)
@@ -781,6 +820,15 @@ async def video_track_handler(
                 inferred_role,
             )
 
+        should_report_deepfake = should_report_deepfake_for_role(inferred_role)
+        logger.info(
+            "Deepfake reporting gate: role_mode=%s inferred_role=%s enabled=%s track=%s",
+            DEEPFAKE_REPORTING_ROLE,
+            inferred_role,
+            should_report_deepfake,
+            track.sid,
+        )
+
         async for event in video_stream:
             current_time = time.time()
             if current_time - last_post_time < FRAME_ANALYSIS_INTERVAL_SECONDS:
@@ -854,7 +902,7 @@ async def video_track_handler(
 
             frame_filename = os.path.join(
                 SAVED_FRAMES_DIR,
-                build_saved_frame_filename(gallery.consultation_id, analyzed_frame_number, event.timestamp_us),
+                build_saved_frame_filename(gallery.consultation_id, analyzed_frame_number, event.timestamp_us, track.sid),
             )
             cv2.imwrite(frame_filename, bgr_frame)
             logger.info("Saved analyzed frame to %s", frame_filename)
@@ -880,7 +928,7 @@ async def video_track_handler(
                 if doctor_report is not None:
                     asyncio.create_task(send_face_match_result(http_session, doctor_report))
 
-            if gallery.consultation_id is not None and deepfake_results:
+            if should_report_deepfake and gallery.consultation_id is not None and deepfake_results:
                 deepfake_scan_payload = build_scan_result_payload(
                     consultation_id=gallery.consultation_id,
                     deepfake_result=deepfake_results,
