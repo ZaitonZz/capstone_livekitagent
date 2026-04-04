@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 
 import aiohttp
 import numpy as np
+from deepfakebench_effnet import DeepfakeBenchEfficientNetB4Adapter, DeepfakeBenchEfficientNetB4Config
 from dotenv import load_dotenv
 from face_recognition import FaceGallery as BaseFaceGallery, cosine_similarity, normalize_embedding
 from livekit import rtc
@@ -21,6 +22,7 @@ from livekit.agents import AutoSubscribe, JobContext, JobProcess, WorkerOptions,
 load_dotenv()
 
 logger = logging.getLogger("video-pipeline-agent")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 LARAVEL_BASE_URL = os.getenv("LARAVEL_BASE_URL", "http://localhost:8000").rstrip("/")
 LARAVEL_ENDPOINT = os.getenv("LARAVEL_ENDPOINT", f"{LARAVEL_BASE_URL}/api/frame-results")
@@ -36,12 +38,25 @@ SAVED_FRAMES_DIR = os.getenv("SAVED_FRAMES_DIR", "saved_frames")
 REPORT_MISSING_REFERENCE_AS_FLAG = os.getenv("REPORT_MISSING_REFERENCE_AS_FLAG", "true").lower() == "true"
 VERIFICATION_TARGET = os.getenv("VERIFICATION_TARGET", "both").strip().lower()
 PARTICIPANT_AWARE_VERIFICATION = os.getenv("PARTICIPANT_AWARE_VERIFICATION", "true").strip().lower() == "true"
-DEEPFAKE_MODEL_PATH = os.getenv(
-    "DEEPFAKE_MODEL_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "df_detector_efficientnet_v2_s_best.pth"),
+DEEPFAKE_MODEL_BACKEND = os.getenv("DEEPFAKE_MODEL_BACKEND", "deepfakebench_effnb4").strip().lower()
+DEEPFAKE_WEIGHTS_DIR = os.getenv("DEEPFAKE_WEIGHTS_DIR", os.path.join(BASE_DIR, "models", "deepfakebench"))
+DEEPFAKE_MODEL_PATH = os.getenv("DEEPFAKE_MODEL_PATH", os.path.join(DEEPFAKE_WEIGHTS_DIR, "effnb4_best.pth"))
+DEEPFAKE_BACKBONE_PATH = os.getenv(
+    "DEEPFAKE_BACKBONE_PATH",
+    os.path.join(DEEPFAKE_WEIGHTS_DIR, "efficientnet-b4-6ed6700e.pth"),
 )
-DEEPFAKE_MODEL_VERSION = os.getenv("DEEPFAKE_MODEL_VERSION", "efficientnet_v2_s")
-DEEPFAKE_INPUT_SIZE = int(os.getenv("DEEPFAKE_INPUT_SIZE", "384"))
+DEEPFAKE_MODEL_URL = os.getenv(
+    "DEEPFAKE_MODEL_URL",
+    "https://github.com/SCLBD/DeepfakeBench/releases/download/v1.0.1/effnb4_best.pth",
+)
+DEEPFAKE_BACKBONE_URL = os.getenv(
+    "DEEPFAKE_BACKBONE_URL",
+    "https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/efficientnet-b4-6ed6700e.pth",
+)
+DEEPFAKE_AUTO_DOWNLOAD = os.getenv("DEEPFAKE_AUTO_DOWNLOAD", "true").strip().lower() == "true"
+DEEPFAKE_PREFER_CPU = os.getenv("DEEPFAKE_PREFER_CPU", "true").strip().lower() == "true"
+DEEPFAKE_MODEL_VERSION = os.getenv("DEEPFAKE_MODEL_VERSION", "deepfakebench_effnb4")
+DEEPFAKE_INPUT_SIZE = int(os.getenv("DEEPFAKE_INPUT_SIZE", "256"))
 DEEPFAKE_FAKE_THRESHOLD = float(os.getenv("DEEPFAKE_FAKE_THRESHOLD", "0.5"))
 DEEPFAKE_INCONCLUSIVE_MARGIN = float(os.getenv("DEEPFAKE_INCONCLUSIVE_MARGIN", "0.05"))
 DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "1"))
@@ -442,81 +457,8 @@ class FaceGallery(BaseFaceGallery):
 
 
 class PipelineManager:
-    def _looks_like_state_dict(self, value: Any) -> bool:
-        if hasattr(value, "state_dict") and callable(value.state_dict):
-            try:
-                return self._looks_like_state_dict(value.state_dict())
-            except Exception:
-                return False
-
-        if not isinstance(value, dict) or len(value) == 0:
-            return False
-
-        sample_keys = list(value.keys())[:20]
-        if not all(isinstance(key, str) for key in sample_keys):
-            return False
-
-        sample_values = list(value.values())[:20]
-        return any(hasattr(sample, "shape") for sample in sample_values)
-
-    def _extract_checkpoint_state_dict(self, checkpoint: Any) -> dict[str, Any]:
-        pending: list[Any] = [checkpoint]
-        visited: set[int] = set()
-
-        while pending:
-            current = pending.pop(0)
-            current_id = id(current)
-            if current_id in visited:
-                continue
-            visited.add(current_id)
-
-            if hasattr(current, "state_dict") and callable(current.state_dict):
-                try:
-                    module_state = current.state_dict()
-                    if self._looks_like_state_dict(module_state):
-                        return module_state
-
-                    if isinstance(module_state, dict):
-                        pending.extend(module_state.values())
-                except Exception:
-                    pass
-
-            if isinstance(current, dict):
-                if self._looks_like_state_dict(current):
-                    return current
-
-                for candidate_key in ["state_dict", "model_state_dict", "model", "net", "network", "weights", "backbone"]:
-                    if candidate_key in current:
-                        pending.append(current[candidate_key])
-
-        return {}
-
-    def _normalize_checkpoint_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        normalized: dict[str, Any] = {}
-        prefixes = ["module.", "model.", "_orig_mod.", "net.", "network.", "backbone."]
-
-        for raw_key, value in state_dict.items():
-            key = raw_key
-            changed = True
-            while changed:
-                changed = False
-                for prefix in prefixes:
-                    if key.startswith(prefix):
-                        key = key[len(prefix):]
-                        changed = True
-
-            if key == "classifier.weight":
-                key = "classifier.1.weight"
-            elif key == "classifier.bias":
-                key = "classifier.1.bias"
-
-            normalized[key] = value
-
-        return normalized
-
     def __init__(self):
         import torch
-        import torchvision.models as tv_models
         from insightface.app import FaceAnalysis
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -528,78 +470,40 @@ class PipelineManager:
         self.face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
         logger.info("InsightFace loaded successfully.")
 
-        self.deepfake_model = tv_models.efficientnet_v2_s(weights=None)
-        classifier_input_features = self.deepfake_model.classifier[1].in_features
-        self.deepfake_model.classifier[1] = torch.nn.Linear(classifier_input_features, 1)
-        self.deepfake_output_classes = 1
+        if DEEPFAKE_MODEL_BACKEND != "deepfakebench_effnb4":
+            logger.warning(
+                "Unsupported deepfake backend '%s', falling back to deepfakebench_effnb4",
+                DEEPFAKE_MODEL_BACKEND,
+            )
 
-        self.deepfake_model_loaded = False
-        if os.path.exists(DEEPFAKE_MODEL_PATH):
-            try:
-                checkpoint = torch.load(DEEPFAKE_MODEL_PATH, map_location=self.device)
+        deepfake_device = torch.device("cpu")
+        if not DEEPFAKE_PREFER_CPU and torch.cuda.is_available():
+            deepfake_device = torch.device("cuda")
 
-                state_dict = self._extract_checkpoint_state_dict(checkpoint)
-                state_dict = self._normalize_checkpoint_state_dict(state_dict)
-
-                if not state_dict:
-                    logger.error("Deepfake checkpoint does not contain a usable state_dict: %s", DEEPFAKE_MODEL_PATH)
-                    self.deepfake_model_loaded = False
-                    self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-                    return
-
-                classifier_weight = state_dict.get("classifier.1.weight")
-                if classifier_weight is not None and getattr(classifier_weight, "ndim", 0) == 2:
-                    checkpoint_output_classes = int(classifier_weight.shape[0])
-                    if checkpoint_output_classes > 0 and checkpoint_output_classes != self.deepfake_output_classes:
-                        self.deepfake_model.classifier[1] = torch.nn.Linear(classifier_input_features, checkpoint_output_classes)
-                        self.deepfake_output_classes = checkpoint_output_classes
-
-                missing_keys, unexpected_keys = self.deepfake_model.load_state_dict(state_dict, strict=False)
-                self.deepfake_model.to(self.device)
-                self.deepfake_model.eval()
-                if missing_keys:
-                    logger.warning("Deepfake model missing keys while loading: %s", missing_keys)
-                if unexpected_keys:
-                    logger.warning("Deepfake model unexpected keys while loading: %s", unexpected_keys)
-
-                model_state_keys = set(self.deepfake_model.state_dict().keys())
-                matched_keys = model_state_keys.intersection(state_dict.keys())
-                critical_keys_present = any(
-                    key.startswith("features.") or key.startswith("classifier.")
-                    for key in matched_keys
-                )
-
-                self.deepfake_model_loaded = critical_keys_present and len(matched_keys) >= 10
-                if self.deepfake_model_loaded:
-                    logger.info(
-                        "Deepfake model loaded from %s with %s output class(es), matched_keys=%s/%s",
-                        DEEPFAKE_MODEL_PATH,
-                        self.deepfake_output_classes,
-                        len(matched_keys),
-                        len(model_state_keys),
-                    )
-                else:
-                    logger.error(
-                        "Deepfake model load incomplete; matched_keys=%s/%s. Model will report inconclusive until key mapping is fixed",
-                        len(matched_keys),
-                        len(model_state_keys),
-                    )
-            except Exception as error:
-                logger.exception("Failed to load deepfake model from %s: %s", DEEPFAKE_MODEL_PATH, error)
-        else:
-            logger.warning("Deepfake model path does not exist: %s", DEEPFAKE_MODEL_PATH)
+        deepfake_config = DeepfakeBenchEfficientNetB4Config(
+            detector_checkpoint_path=DEEPFAKE_MODEL_PATH,
+            detector_checkpoint_url=DEEPFAKE_MODEL_URL,
+            backbone_weights_path=DEEPFAKE_BACKBONE_PATH,
+            backbone_weights_url=DEEPFAKE_BACKBONE_URL,
+            model_version=DEEPFAKE_MODEL_VERSION,
+            auto_download=DEEPFAKE_AUTO_DOWNLOAD,
+            input_size=DEEPFAKE_INPUT_SIZE,
+        )
+        self.deepfake_adapter = DeepfakeBenchEfficientNetB4Adapter(
+            config=deepfake_config,
+            device=deepfake_device,
+            logger=logger,
+        )
 
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     def _infer_deepfake_from_frame(self, rgb_data_array: np.ndarray) -> dict[str, Any]:
-        import cv2
-        import torch
-
         start_time = time.time()
+        detector_model_name = "DeepfakeBench-EfficientNetB4"
 
-        if not self.deepfake_model_loaded:
+        if not self.deepfake_adapter.is_loaded:
             return {
-                "model": "EfficientNetV2-S",
+                "model": detector_model_name,
                 "model_version": DEEPFAKE_MODEL_VERSION,
                 "result": "inconclusive",
                 "fake_score": None,
@@ -609,32 +513,17 @@ class PipelineManager:
             }
 
         try:
-            resized_rgb = cv2.resize(rgb_data_array, (DEEPFAKE_INPUT_SIZE, DEEPFAKE_INPUT_SIZE), interpolation=cv2.INTER_AREA)
-            normalized = resized_rgb.astype(np.float32) / 255.0
-
-            tensor = torch.from_numpy(normalized).permute(2, 0, 1).unsqueeze(0)
-            mean = torch.tensor([0.485, 0.456, 0.406], dtype=tensor.dtype).view(1, 3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225], dtype=tensor.dtype).view(1, 3, 1, 1)
-            tensor = (tensor - mean) / std
-            tensor = tensor.to(self.device)
-
-            with torch.no_grad():
-                logits = self.deepfake_model(tensor)
-
-            fake_score: float
-            flattened_logits = logits.flatten()
-
-            if self.deepfake_output_classes == 1 or flattened_logits.numel() == 1:
-                fake_score = float(torch.sigmoid(flattened_logits[0]).item())
-            else:
-                probabilities = torch.softmax(flattened_logits, dim=0)
-                target_index = DEEPFAKE_FAKE_CLASS_INDEX if DEEPFAKE_FAKE_CLASS_INDEX < probabilities.numel() else probabilities.numel() - 1
-                fake_score = float(probabilities[target_index].item())
+            fake_score = self.deepfake_adapter.infer_fake_score(
+                rgb_data_array,
+                fake_class_index=DEEPFAKE_FAKE_CLASS_INDEX,
+            )
+            if fake_score is None:
+                raise RuntimeError("Deepfake adapter returned no score")
 
             result, confidence_score = determine_deepfake_result(fake_score)
 
             return {
-                "model": "EfficientNetV2-S",
+                "model": detector_model_name,
                 "model_version": DEEPFAKE_MODEL_VERSION,
                 "result": result,
                 "fake_score": round(fake_score, 4),
@@ -645,7 +534,7 @@ class PipelineManager:
         except Exception as error:
             logger.exception("Deepfake inference failed: %s", error)
             return {
-                "model": "EfficientNetV2-S",
+                "model": detector_model_name,
                 "model_version": DEEPFAKE_MODEL_VERSION,
                 "result": "inconclusive",
                 "fake_score": None,
