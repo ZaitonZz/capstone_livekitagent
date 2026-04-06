@@ -1,8 +1,11 @@
 import unittest
 
+import numpy as np
 import torch
 
 from deepfakebench_effnet import (
+    aggregate_fake_scores,
+    crop_face_regions,
     extract_checkpoint_state_dict,
     logits_to_fake_probability,
     normalize_checkpoint_state_dict,
@@ -50,6 +53,32 @@ class DeepfakeBenchEfficientNetUtilsTest(unittest.TestCase):
         self.assertEqual(tuple(tensor.shape), (1, 3, 4, 4))
         self.assertAlmostEqual(float(tensor.min().item()), -1.0, places=4)
         self.assertAlmostEqual(float(tensor.max().item()), -1.0, places=4)
+
+    def test_crop_face_regions_returns_expanded_crop(self) -> None:
+        rgb = np.zeros((100, 120, 3), dtype=np.uint8)
+        boxes = [[30, 20, 70, 60, 0.9]]
+
+        crops = crop_face_regions(rgb, boxes, margin_ratio=0.25, min_face_size=16)
+
+        self.assertEqual(len(crops), 1)
+        crop = crops[0]
+        self.assertGreaterEqual(crop.shape[0], 40)
+        self.assertGreaterEqual(crop.shape[1], 40)
+
+    def test_crop_face_regions_filters_small_faces(self) -> None:
+        rgb = np.zeros((100, 100, 3), dtype=np.uint8)
+        boxes = [[10, 10, 20, 20, 0.99]]
+
+        crops = crop_face_regions(rgb, boxes, margin_ratio=0.2, min_face_size=24)
+
+        self.assertEqual(crops, [])
+
+    def test_aggregate_fake_scores_respects_mode(self) -> None:
+        scores = [0.2, 0.8, 0.6]
+
+        self.assertAlmostEqual(aggregate_fake_scores(scores, mode="max"), 0.8, places=6)
+        self.assertAlmostEqual(aggregate_fake_scores(scores, mode="mean"), 0.533333, places=5)
+        self.assertAlmostEqual(aggregate_fake_scores(scores, mode="median"), 0.6, places=6)
 
 
 if __name__ == "__main__":

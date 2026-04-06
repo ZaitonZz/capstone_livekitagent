@@ -13,7 +13,12 @@ from urllib.parse import urljoin
 
 import aiohttp
 import numpy as np
-from deepfakebench_effnet import DeepfakeBenchEfficientNetB4Adapter, DeepfakeBenchEfficientNetB4Config
+from deepfakebench_effnet import (
+    DeepfakeBenchEfficientNetB4Adapter,
+    DeepfakeBenchEfficientNetB4Config,
+    aggregate_fake_scores,
+    crop_face_regions,
+)
 from dotenv import load_dotenv
 from face_recognition import FaceGallery as BaseFaceGallery, cosine_similarity, normalize_embedding
 from livekit import rtc
@@ -60,6 +65,11 @@ DEEPFAKE_INPUT_SIZE = int(os.getenv("DEEPFAKE_INPUT_SIZE", "256"))
 DEEPFAKE_FAKE_THRESHOLD = float(os.getenv("DEEPFAKE_FAKE_THRESHOLD", "0.5"))
 DEEPFAKE_INCONCLUSIVE_MARGIN = float(os.getenv("DEEPFAKE_INCONCLUSIVE_MARGIN", "0.05"))
 DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "1"))
+DEEPFAKE_USE_FACE_CROPS = os.getenv("DEEPFAKE_USE_FACE_CROPS", "true").strip().lower() == "true"
+DEEPFAKE_FULL_FRAME_FALLBACK = os.getenv("DEEPFAKE_FULL_FRAME_FALLBACK", "true").strip().lower() == "true"
+DEEPFAKE_FACE_MARGIN_RATIO = float(os.getenv("DEEPFAKE_FACE_MARGIN_RATIO", "0.25"))
+DEEPFAKE_MIN_FACE_SIZE = int(os.getenv("DEEPFAKE_MIN_FACE_SIZE", "48"))
+DEEPFAKE_SCORE_AGGREGATION = os.getenv("DEEPFAKE_SCORE_AGGREGATION", "max").strip().lower()
 DEEPFAKE_REPORTING_ROLE = os.getenv("DEEPFAKE_REPORTING_ROLE", "patient").strip().lower()
 
 
@@ -497,7 +507,11 @@ class PipelineManager:
 
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-    def _infer_deepfake_from_frame(self, rgb_data_array: np.ndarray) -> dict[str, Any]:
+    def _infer_deepfake_from_frame(
+        self,
+        rgb_data_array: np.ndarray,
+        face_boxes: list[list[float]] | None = None,
+    ) -> dict[str, Any]:
         start_time = time.time()
         detector_model_name = "DeepfakeBench-EfficientNetB4"
 
@@ -509,16 +523,40 @@ class PipelineManager:
                 "fake_score": None,
                 "confidence_score": 0.0,
                 "flagged": False,
+                "faces_evaluated": 0,
+                "score_aggregation": DEEPFAKE_SCORE_AGGREGATION,
                 "inference_time_ms": int((time.time() - start_time) * 1000),
             }
 
         try:
-            fake_score = self.deepfake_adapter.infer_fake_score(
-                rgb_data_array,
-                fake_class_index=DEEPFAKE_FAKE_CLASS_INDEX,
-            )
-            if fake_score is None:
-                raise RuntimeError("Deepfake adapter returned no score")
+            candidate_regions: list[np.ndarray] = []
+            if DEEPFAKE_USE_FACE_CROPS:
+                candidate_regions = crop_face_regions(
+                    rgb_data_array,
+                    face_boxes,
+                    margin_ratio=DEEPFAKE_FACE_MARGIN_RATIO,
+                    min_face_size=DEEPFAKE_MIN_FACE_SIZE,
+                )
+
+            if not candidate_regions and DEEPFAKE_FULL_FRAME_FALLBACK:
+                candidate_regions = [rgb_data_array]
+
+            if not candidate_regions:
+                raise RuntimeError("No valid regions available for deepfake inference")
+
+            fake_scores: list[float] = []
+            for region in candidate_regions:
+                score = self.deepfake_adapter.infer_fake_score(
+                    region,
+                    fake_class_index=DEEPFAKE_FAKE_CLASS_INDEX,
+                )
+                if score is not None:
+                    fake_scores.append(score)
+
+            if not fake_scores:
+                raise RuntimeError("Deepfake adapter returned no scores")
+
+            fake_score = aggregate_fake_scores(fake_scores, mode=DEEPFAKE_SCORE_AGGREGATION)
 
             result, confidence_score = determine_deepfake_result(fake_score)
 
@@ -529,6 +567,8 @@ class PipelineManager:
                 "fake_score": round(fake_score, 4),
                 "confidence_score": round(confidence_score, 4),
                 "flagged": result == "fake",
+                "faces_evaluated": len(fake_scores),
+                "score_aggregation": DEEPFAKE_SCORE_AGGREGATION,
                 "inference_time_ms": int((time.time() - start_time) * 1000),
             }
         except Exception as error:
@@ -540,6 +580,8 @@ class PipelineManager:
                 "fake_score": None,
                 "confidence_score": 0.0,
                 "flagged": False,
+                "faces_evaluated": 0,
+                "score_aggregation": DEEPFAKE_SCORE_AGGREGATION,
                 "inference_time_ms": int((time.time() - start_time) * 1000),
             }
 
@@ -612,7 +654,7 @@ class PipelineManager:
                     if best_doctor_candidate is None or candidate["similarity"] > best_doctor_candidate["similarity"]:
                         best_doctor_candidate = candidate
 
-        deepfake_results = self._infer_deepfake_from_frame(rgb_data_array)
+        deepfake_results = self._infer_deepfake_from_frame(rgb_data_array, face_boxes=bounding_boxes)
 
         return {
             "model_A": {

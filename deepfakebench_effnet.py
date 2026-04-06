@@ -171,6 +171,71 @@ def preprocess_rgb_frame(
     return (tensor - mean_tensor) / std_tensor
 
 
+def crop_face_regions(
+    rgb_frame: np.ndarray,
+    face_boxes: list[list[float]] | None,
+    margin_ratio: float = 0.25,
+    min_face_size: int = 64,
+) -> list[np.ndarray]:
+    if rgb_frame.ndim != 3:
+        return []
+
+    if not face_boxes:
+        return []
+
+    frame_height, frame_width = rgb_frame.shape[:2]
+    crops: list[np.ndarray] = []
+
+    for raw_box in face_boxes:
+        if len(raw_box) < 4:
+            continue
+
+        x1, y1, x2, y2 = [int(float(value)) for value in raw_box[:4]]
+        x1 = max(0, min(x1, frame_width - 1))
+        y1 = max(0, min(y1, frame_height - 1))
+        x2 = max(0, min(x2, frame_width))
+        y2 = max(0, min(y2, frame_height))
+
+        width = x2 - x1
+        height = y2 - y1
+        if width <= 0 or height <= 0:
+            continue
+
+        if min(width, height) < min_face_size:
+            continue
+
+        pad_x = int(width * margin_ratio)
+        pad_y = int(height * margin_ratio)
+
+        crop_x1 = max(0, x1 - pad_x)
+        crop_y1 = max(0, y1 - pad_y)
+        crop_x2 = min(frame_width, x2 + pad_x)
+        crop_y2 = min(frame_height, y2 + pad_y)
+
+        crop = rgb_frame[crop_y1:crop_y2, crop_x1:crop_x2]
+        if crop.size == 0:
+            continue
+
+        crops.append(crop)
+
+    return crops
+
+
+def aggregate_fake_scores(scores: list[float], mode: str = "max") -> float:
+    if not scores:
+        raise ValueError("No scores to aggregate")
+
+    normalized_mode = mode.strip().lower()
+    if normalized_mode == "mean":
+        return float(np.mean(scores))
+    if normalized_mode == "median":
+        return float(np.median(scores))
+    if normalized_mode == "min":
+        return float(np.min(scores))
+
+    return float(np.max(scores))
+
+
 def logits_to_fake_probability(logits: torch.Tensor, fake_class_index: int = 1) -> float:
     flattened_logits = logits.flatten()
 
