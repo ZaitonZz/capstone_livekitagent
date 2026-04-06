@@ -1,7 +1,13 @@
 import unittest
 
 import agent
-from agent import build_saved_frame_filename, build_scan_result_payload, determine_deepfake_result, should_report_deepfake_for_role
+from agent import (
+    build_saved_frame_filename,
+    build_scan_result_payload,
+    determine_deepfake_result,
+    should_analyze_frame_timestamp,
+    should_report_deepfake_for_role,
+)
 
 
 class AgentHelperFunctionsTest(unittest.TestCase):
@@ -78,6 +84,34 @@ class AgentHelperFunctionsTest(unittest.TestCase):
             self.assertEqual(should_report_deepfake_for_role(None), True)
         finally:
             agent.DEEPFAKE_REPORTING_ROLE = original
+
+    def test_should_analyze_frame_timestamp_allows_first_frame(self) -> None:
+        self.assertEqual(
+            should_analyze_frame_timestamp(
+                last_analyzed_timestamp_us=None,
+                current_timestamp_us=1_000_000,
+                interval_seconds=1.0,
+            ),
+            True,
+        )
+
+    def test_should_analyze_frame_timestamp_enforces_interval(self) -> None:
+        self.assertEqual(
+            should_analyze_frame_timestamp(
+                last_analyzed_timestamp_us=1_000_000,
+                current_timestamp_us=1_500_000,
+                interval_seconds=1.0,
+            ),
+            False,
+        )
+        self.assertEqual(
+            should_analyze_frame_timestamp(
+                last_analyzed_timestamp_us=1_000_000,
+                current_timestamp_us=2_000_000,
+                interval_seconds=1.0,
+            ),
+            True,
+        )
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ PIPELINE_INTERNAL_BASE_URL = os.getenv(
 ).rstrip("/")
 PIPELINE_SHARED_SECRET = os.getenv("PIPELINE_SHARED_SECRET", "")
 FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.4"))
-FRAME_ANALYSIS_INTERVAL_SECONDS = float(os.getenv("FRAME_ANALYSIS_INTERVAL_SECONDS", "5.0"))
+FRAME_ANALYSIS_INTERVAL_SECONDS = float(os.getenv("FRAME_ANALYSIS_INTERVAL_SECONDS", "1.0"))
 FACE_MATCH_STREAK_TARGET = int(os.getenv("FACE_MATCH_STREAK_TARGET", "3"))
 SAVED_FRAMES_DIR = os.getenv("SAVED_FRAMES_DIR", "saved_frames")
 REPORT_MISSING_REFERENCE_AS_FLAG = os.getenv("REPORT_MISSING_REFERENCE_AS_FLAG", "true").lower() == "true"
@@ -72,7 +72,7 @@ DEEPFAKE_FULL_FRAME_FALLBACK = os.getenv("DEEPFAKE_FULL_FRAME_FALLBACK", "false"
 DEEPFAKE_FACE_MARGIN_RATIO = float(os.getenv("DEEPFAKE_FACE_MARGIN_RATIO", "0.25"))
 DEEPFAKE_MIN_FACE_SIZE = int(os.getenv("DEEPFAKE_MIN_FACE_SIZE", "48"))
 DEEPFAKE_SCORE_AGGREGATION = os.getenv("DEEPFAKE_SCORE_AGGREGATION", "max").strip().lower()
-DEEPFAKE_REPORTING_ROLE = os.getenv("DEEPFAKE_REPORTING_ROLE", "patient").strip().lower()
+DEEPFAKE_REPORTING_ROLE = os.getenv("DEEPFAKE_REPORTING_ROLE", "both").strip().lower()
 
 
 def build_pipeline_signature_headers(body: str = "") -> dict[str, str]:
@@ -123,6 +123,18 @@ def should_report_deepfake_for_role(inferred_role: str | None) -> bool:
         return inferred_role == DEEPFAKE_REPORTING_ROLE
 
     return True
+
+
+def should_analyze_frame_timestamp(
+    last_analyzed_timestamp_us: int | None,
+    current_timestamp_us: int,
+    interval_seconds: float,
+) -> bool:
+    if last_analyzed_timestamp_us is None:
+        return True
+
+    interval_us = max(int(interval_seconds * 1_000_000), 0)
+    return (current_timestamp_us - last_analyzed_timestamp_us) >= interval_us
 
 
 def build_saved_frame_filename(consultation_id: int | None, frame_number: int, timestamp_us: int, track_id: str) -> str:
@@ -820,7 +832,7 @@ async def video_track_handler(
 
     active_pipeline = get_or_create_pipeline()
     video_stream = rtc.VideoStream(track)
-    last_post_time = 0.0
+    last_analyzed_timestamp_us: int | None = None
     analyzed_frame_number = 0
     os.makedirs(SAVED_FRAMES_DIR, exist_ok=True)
 
@@ -860,11 +872,15 @@ async def video_track_handler(
         )
 
         async for event in video_stream:
-            current_time = time.time()
-            if current_time - last_post_time < FRAME_ANALYSIS_INTERVAL_SECONDS:
+            frame_timestamp_us = int(event.timestamp_us)
+            if not should_analyze_frame_timestamp(
+                last_analyzed_timestamp_us,
+                frame_timestamp_us,
+                FRAME_ANALYSIS_INTERVAL_SECONDS,
+            ):
                 continue
 
-            last_post_time = current_time
+            last_analyzed_timestamp_us = frame_timestamp_us
             analyzed_frame_number += 1
 
             rtc_frame = event.frame
@@ -939,7 +955,7 @@ async def video_track_handler(
 
             frame_payload = {
                 "track_id": track.sid,
-                "timestamp": event.timestamp_us,
+                "timestamp": frame_timestamp_us,
                 "width": argb_frame.width,
                 "height": argb_frame.height,
                 "image": None,
