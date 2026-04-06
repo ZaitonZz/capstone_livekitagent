@@ -33,6 +33,20 @@ load_dotenv()
 logger = logging.getLogger("video-pipeline-agent")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def read_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        parsed_value = int(raw_value.strip())
+    except (TypeError, ValueError):
+        return default
+
+    return parsed_value if parsed_value > 0 else default
+
+
 LARAVEL_BASE_URL = os.getenv("LARAVEL_BASE_URL", "http://localhost:8000").rstrip("/")
 LARAVEL_ENDPOINT = os.getenv("LARAVEL_ENDPOINT", f"{LARAVEL_BASE_URL}/api/frame-results")
 PIPELINE_INTERNAL_BASE_URL = os.getenv(
@@ -42,6 +56,8 @@ PIPELINE_INTERNAL_BASE_URL = os.getenv(
 PIPELINE_SHARED_SECRET = os.getenv("PIPELINE_SHARED_SECRET", "")
 FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.4"))
 FRAME_ANALYSIS_INTERVAL_SECONDS = float(os.getenv("FRAME_ANALYSIS_INTERVAL_SECONDS", "1.0"))
+VIDEO_STREAM_CAPACITY = read_positive_int_env("VIDEO_STREAM_CAPACITY", 1)
+FRAME_ANALYSIS_MAX_WORKERS = read_positive_int_env("FRAME_ANALYSIS_MAX_WORKERS", 1)
 FACE_MATCH_STREAK_TARGET = int(os.getenv("FACE_MATCH_STREAK_TARGET", "3"))
 SAVED_FRAMES_DIR = os.getenv("SAVED_FRAMES_DIR", "saved_frames")
 REPORT_MISSING_REFERENCE_AS_FLAG = os.getenv("REPORT_MISSING_REFERENCE_AS_FLAG", "true").lower() == "true"
@@ -166,6 +182,85 @@ def build_scan_result_payload(
         "flagged": flagged,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def format_overlay_metric(value: Any, precision: int = 4) -> str:
+    if value is None:
+        return "n/a"
+
+    try:
+        return f"{float(value):.{precision}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def build_deepfake_overlay_lines(deepfake_result: dict[str, Any] | None) -> list[str]:
+    if not deepfake_result:
+        return [
+            "deepfake: unavailable",
+            "confidence: n/a",
+            "scores f/a: n/a/n/a",
+            f"class index: {DEEPFAKE_FAKE_CLASS_INDEX}",
+            f"aggregation: {DEEPFAKE_SCORE_AGGREGATION}",
+            "regions: 0",
+        ]
+
+    class_index_value = deepfake_result.get("fake_class_index", DEEPFAKE_FAKE_CLASS_INDEX)
+    aggregation_mode = deepfake_result.get("score_aggregation", DEEPFAKE_SCORE_AGGREGATION)
+
+    try:
+        regions_evaluated = int(deepfake_result.get("faces_evaluated", 0))
+    except (TypeError, ValueError):
+        regions_evaluated = 0
+
+    return [
+        f"deepfake: {deepfake_result.get('result', 'inconclusive')}",
+        f"confidence: {format_overlay_metric(deepfake_result.get('confidence_score'))}",
+        (
+            "scores f/a: "
+            f"{format_overlay_metric(deepfake_result.get('fake_score'))}/"
+            f"{format_overlay_metric(deepfake_result.get('alternate_score'))}"
+        ),
+        f"class index: {class_index_value}",
+        f"aggregation: {aggregation_mode}",
+        f"regions: {regions_evaluated}",
+    ]
+
+
+def draw_text_overlay(frame: np.ndarray, lines: list[str]) -> None:
+    import cv2
+
+    if not lines:
+        return
+
+    start_x = 12
+    start_y = 26
+    line_height = 24
+    text_thickness = 2
+    text_color = (255, 255, 255)
+    background_color = (16, 16, 16)
+
+    for index, line in enumerate(lines):
+        text_y = start_y + (index * line_height)
+        (text_width, text_height), baseline = cv2.getTextSize(
+            line,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            text_thickness,
+        )
+        top_left = (start_x - 6, max(text_y - text_height - 6, 0))
+        bottom_right = (start_x + text_width + 6, min(text_y + baseline + 4, frame.shape[0] - 1))
+        cv2.rectangle(frame, top_left, bottom_right, background_color, -1)
+        cv2.putText(
+            frame,
+            line,
+            (start_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            text_color,
+            text_thickness,
+            cv2.LINE_AA,
+        )
 
 
 class FaceGallery(BaseFaceGallery):
@@ -530,7 +625,8 @@ class PipelineManager:
             DEEPFAKE_SCORE_AGGREGATION,
         )
 
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=FRAME_ANALYSIS_MAX_WORKERS)
+        logger.info("Frame analysis executor max_workers=%s", FRAME_ANALYSIS_MAX_WORKERS)
 
     def _infer_deepfake_from_frame(
         self,
@@ -851,7 +947,8 @@ async def video_track_handler(
     logger.info("Video track subscribed: %s", track.sid)
 
     active_pipeline = get_or_create_pipeline()
-    video_stream = rtc.VideoStream(track)
+    video_stream = rtc.VideoStream(track, capacity=VIDEO_STREAM_CAPACITY)
+    logger.info("Video stream configured with capacity=%s for track=%s", VIDEO_STREAM_CAPACITY, track.sid)
     last_analyzed_timestamp_us: int | None = None
     analyzed_frame_number = 0
     os.makedirs(SAVED_FRAMES_DIR, exist_ok=True)
@@ -965,6 +1062,8 @@ async def video_track_handler(
                     color,
                     2,
                 )
+
+            draw_text_overlay(bgr_frame, build_deepfake_overlay_lines(deepfake_results))
 
             frame_filename = os.path.join(
                 SAVED_FRAMES_DIR,
