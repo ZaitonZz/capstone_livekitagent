@@ -64,7 +64,9 @@ DEEPFAKE_MODEL_VERSION = os.getenv("DEEPFAKE_MODEL_VERSION", "deepfakebench_effn
 DEEPFAKE_INPUT_SIZE = int(os.getenv("DEEPFAKE_INPUT_SIZE", "256"))
 DEEPFAKE_FAKE_THRESHOLD = float(os.getenv("DEEPFAKE_FAKE_THRESHOLD", "0.5"))
 DEEPFAKE_INCONCLUSIVE_MARGIN = float(os.getenv("DEEPFAKE_INCONCLUSIVE_MARGIN", "0.05"))
-DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "1"))
+# Some released EfficientNet checkpoints are observed to emit fake-probability on class index 0.
+# Keep this env-overridable for fast on-site tuning.
+DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "0"))
 DEEPFAKE_USE_FACE_CROPS = os.getenv("DEEPFAKE_USE_FACE_CROPS", "true").strip().lower() == "true"
 DEEPFAKE_FULL_FRAME_FALLBACK = os.getenv("DEEPFAKE_FULL_FRAME_FALLBACK", "false").strip().lower() == "true"
 DEEPFAKE_FACE_MARGIN_RATIO = float(os.getenv("DEEPFAKE_FACE_MARGIN_RATIO", "0.25"))
@@ -503,6 +505,14 @@ class PipelineManager:
             config=deepfake_config,
             device=deepfake_device,
             logger=logger,
+        )
+        logger.info(
+            "Deepfake config: fake_class_index=%s threshold=%.3f face_crops=%s full_frame_fallback=%s aggregation=%s",
+            DEEPFAKE_FAKE_CLASS_INDEX,
+            DEEPFAKE_FAKE_THRESHOLD,
+            DEEPFAKE_USE_FACE_CROPS,
+            DEEPFAKE_FULL_FRAME_FALLBACK,
+            DEEPFAKE_SCORE_AGGREGATION,
         )
 
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)

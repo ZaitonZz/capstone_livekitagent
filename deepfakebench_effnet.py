@@ -7,10 +7,19 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+# Suppress known CPU-only NNPACK initialization warning on unsupported hardware.
+os.environ.setdefault("PYTORCH_DISABLE_NNPACK", "1")
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    if hasattr(torch.backends, "nnpack"):
+        torch.backends.nnpack.enabled = False
+except Exception:
+    pass
 
 
 @dataclass(frozen=True)
