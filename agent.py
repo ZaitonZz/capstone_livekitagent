@@ -11,6 +11,10 @@ import time
 from typing import Any
 from urllib.parse import urljoin
 
+# Apply torch runtime log controls before any module imports torch.
+os.environ.setdefault("PYTORCH_DISABLE_NNPACK", "1")
+os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
+
 import aiohttp
 import numpy as np
 from deepfakebench_effnet import (
@@ -64,9 +68,8 @@ DEEPFAKE_MODEL_VERSION = os.getenv("DEEPFAKE_MODEL_VERSION", "deepfakebench_effn
 DEEPFAKE_INPUT_SIZE = int(os.getenv("DEEPFAKE_INPUT_SIZE", "256"))
 DEEPFAKE_FAKE_THRESHOLD = float(os.getenv("DEEPFAKE_FAKE_THRESHOLD", "0.5"))
 DEEPFAKE_INCONCLUSIVE_MARGIN = float(os.getenv("DEEPFAKE_INCONCLUSIVE_MARGIN", "0.05"))
-# Some released EfficientNet checkpoints are observed to emit fake-probability on class index 0.
-# Keep this env-overridable for fast on-site tuning.
-DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "0"))
+# DeepfakeBench train_config label_dict maps fake->1 and real->0.
+DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "1"))
 DEEPFAKE_USE_FACE_CROPS = os.getenv("DEEPFAKE_USE_FACE_CROPS", "true").strip().lower() == "true"
 DEEPFAKE_FULL_FRAME_FALLBACK = os.getenv("DEEPFAKE_FULL_FRAME_FALLBACK", "false").strip().lower() == "true"
 DEEPFAKE_FACE_MARGIN_RATIO = float(os.getenv("DEEPFAKE_FACE_MARGIN_RATIO", "0.25"))
@@ -566,28 +569,43 @@ class PipelineManager:
             if not candidate_regions:
                 raise RuntimeError("No valid regions available for deepfake inference")
 
-            fake_scores: list[float] = []
+            selected_scores: list[float] = []
+            alternate_scores: list[float] = []
             for region in candidate_regions:
-                score = self.deepfake_adapter.infer_fake_score(
-                    region,
-                    fake_class_index=DEEPFAKE_FAKE_CLASS_INDEX,
-                )
-                if score is not None:
-                    fake_scores.append(score)
+                probabilities = self.deepfake_adapter.infer_class_probabilities(region)
+                if probabilities is None:
+                    continue
 
-            if not fake_scores:
+                selected_index = (
+                    DEEPFAKE_FAKE_CLASS_INDEX
+                    if 0 <= DEEPFAKE_FAKE_CLASS_INDEX < len(probabilities)
+                    else len(probabilities) - 1
+                )
+                selected_scores.append(float(probabilities[selected_index]))
+
+                if len(probabilities) == 2:
+                    alternate_scores.append(float(probabilities[1 - selected_index]))
+
+            if not selected_scores:
                 raise RuntimeError("Deepfake adapter returned no scores")
 
-            fake_score = aggregate_fake_scores(fake_scores, mode=DEEPFAKE_SCORE_AGGREGATION)
+            fake_score = aggregate_fake_scores(selected_scores, mode=DEEPFAKE_SCORE_AGGREGATION)
+            alternate_score = (
+                aggregate_fake_scores(alternate_scores, mode=DEEPFAKE_SCORE_AGGREGATION)
+                if alternate_scores
+                else None
+            )
 
             result, confidence_score = determine_deepfake_result(fake_score)
             logger.info(
-                "Deepfake inference: result=%s fake_score=%.4f confidence=%.4f regions=%s aggregation=%s",
+                "Deepfake inference: result=%s fake_score=%.4f alternate_score=%s confidence=%.4f regions=%s aggregation=%s fake_class_index=%s",
                 result,
                 fake_score,
+                "none" if alternate_score is None else f"{alternate_score:.4f}",
                 confidence_score,
-                len(fake_scores),
+                len(selected_scores),
                 DEEPFAKE_SCORE_AGGREGATION,
+                DEEPFAKE_FAKE_CLASS_INDEX,
             )
 
             return {
@@ -595,9 +613,11 @@ class PipelineManager:
                 "model_version": DEEPFAKE_MODEL_VERSION,
                 "result": result,
                 "fake_score": round(fake_score, 4),
+                "alternate_score": None if alternate_score is None else round(alternate_score, 4),
                 "confidence_score": round(confidence_score, 4),
                 "flagged": result == "fake",
-                "faces_evaluated": len(fake_scores),
+                "faces_evaluated": len(selected_scores),
+                "fake_class_index": DEEPFAKE_FAKE_CLASS_INDEX,
                 "score_aggregation": DEEPFAKE_SCORE_AGGREGATION,
                 "inference_time_ms": int((time.time() - start_time) * 1000),
             }

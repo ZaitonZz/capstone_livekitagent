@@ -9,6 +9,7 @@ from typing import Any
 
 # Suppress known CPU-only NNPACK initialization warning on unsupported hardware.
 os.environ.setdefault("PYTORCH_DISABLE_NNPACK", "1")
+os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
 
 import numpy as np
 import torch
@@ -306,7 +307,7 @@ class DeepfakeBenchEfficientNetB4Adapter:
     def is_loaded(self) -> bool:
         return self.model is not None
 
-    def infer_fake_score(self, rgb_frame: np.ndarray, fake_class_index: int = 1) -> float | None:
+    def infer_class_probabilities(self, rgb_frame: np.ndarray) -> list[float] | None:
         if self.model is None:
             return None
 
@@ -316,7 +317,21 @@ class DeepfakeBenchEfficientNetB4Adapter:
         with torch.no_grad():
             logits = self.model(tensor)
 
-        return logits_to_fake_probability(logits, fake_class_index=fake_class_index)
+        flattened_logits = logits.flatten()
+        if flattened_logits.numel() == 1:
+            fake_probability = float(torch.sigmoid(flattened_logits[0]).item())
+            return [1.0 - fake_probability, fake_probability]
+
+        probabilities = torch.softmax(flattened_logits, dim=0)
+        return [float(probability.item()) for probability in probabilities]
+
+    def infer_fake_score(self, rgb_frame: np.ndarray, fake_class_index: int = 1) -> float | None:
+        class_probabilities = self.infer_class_probabilities(rgb_frame)
+        if class_probabilities is None:
+            return None
+
+        index = fake_class_index if 0 <= fake_class_index < len(class_probabilities) else len(class_probabilities) - 1
+        return class_probabilities[index]
 
     def _prepare_weights(self) -> None:
         required_files = (
