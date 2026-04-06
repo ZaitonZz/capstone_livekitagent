@@ -1,10 +1,13 @@
 import unittest
+import os
 
 import agent
 from agent import (
+    build_deepfake_overlay_lines,
     build_saved_frame_filename,
     build_scan_result_payload,
     determine_deepfake_result,
+    read_positive_int_env,
     should_analyze_frame_timestamp,
     should_report_deepfake_for_role,
 )
@@ -111,6 +114,68 @@ class AgentHelperFunctionsTest(unittest.TestCase):
                 interval_seconds=1.0,
             ),
             True,
+        )
+
+    def test_read_positive_int_env_returns_default_for_invalid_values(self) -> None:
+        env_key = "UNIT_TEST_POSITIVE_INT"
+        original_value = os.environ.get(env_key)
+
+        try:
+            os.environ[env_key] = "abc"
+            self.assertEqual(read_positive_int_env(env_key, 7), 7)
+
+            os.environ[env_key] = "0"
+            self.assertEqual(read_positive_int_env(env_key, 7), 7)
+
+            os.environ[env_key] = "-2"
+            self.assertEqual(read_positive_int_env(env_key, 7), 7)
+
+            os.environ[env_key] = "3"
+            self.assertEqual(read_positive_int_env(env_key, 7), 3)
+        finally:
+            if original_value is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = original_value
+
+    def test_build_deepfake_overlay_lines_includes_expected_metrics(self) -> None:
+        lines = build_deepfake_overlay_lines(
+            {
+                "result": "fake",
+                "confidence_score": 0.81234,
+                "fake_score": 0.93456,
+                "alternate_score": 0.06544,
+                "fake_class_index": 1,
+                "score_aggregation": "max",
+                "faces_evaluated": 3,
+            }
+        )
+
+        self.assertEqual(
+            lines,
+            [
+                "deepfake: fake",
+                "confidence: 0.8123",
+                "scores f/a: 0.9346/0.0654",
+                "class index: 1",
+                "aggregation: max",
+                "regions: 3",
+            ],
+        )
+
+    def test_build_deepfake_overlay_lines_handles_empty_results(self) -> None:
+        lines = build_deepfake_overlay_lines(None)
+
+        self.assertEqual(
+            lines,
+            [
+                "deepfake: unavailable",
+                "confidence: n/a",
+                "scores f/a: n/a/n/a",
+                f"class index: {agent.DEEPFAKE_FAKE_CLASS_INDEX}",
+                f"aggregation: {agent.DEEPFAKE_SCORE_AGGREGATION}",
+                "regions: 0",
+            ],
         )
 
 
