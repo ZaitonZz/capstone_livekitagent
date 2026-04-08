@@ -49,6 +49,9 @@ class AgentHelperFunctionsTest(unittest.TestCase):
     def test_build_scan_result_payload_uses_expected_keys(self) -> None:
         payload = build_scan_result_payload(
             consultation_id=51,
+            microcheck_id=7,
+            user_id=103,
+            verified_role="patient",
             deepfake_result={
                 "result": "fake",
                 "confidence_score": 0.81234,
@@ -60,6 +63,9 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         )
 
         self.assertEqual(payload["consultation_id"], 51)
+        self.assertEqual(payload["microcheck_id"], 7)
+        self.assertEqual(payload["user_id"], 103)
+        self.assertEqual(payload["verified_role"], "patient")
         self.assertEqual(payload["result"], "fake")
         self.assertEqual(payload["confidence_score"], 0.8123)
         self.assertEqual(payload["frame_path"], "saved_frames/consultation-51_frame-000001_123.jpg")

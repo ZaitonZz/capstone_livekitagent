@@ -164,6 +164,9 @@ def build_saved_frame_filename(consultation_id: int | None, frame_number: int, t
 
 def build_scan_result_payload(
     consultation_id: int,
+    microcheck_id: int,
+    user_id: int,
+    verified_role: str,
     deepfake_result: dict[str, Any],
     frame_path: str,
     frame_number: int,
@@ -174,6 +177,9 @@ def build_scan_result_payload(
 
     return {
         "consultation_id": consultation_id,
+        "microcheck_id": microcheck_id,
+        "user_id": user_id,
+        "verified_role": verified_role,
         "result": result,
         "confidence_score": confidence_score,
         "frame_path": frame_path,
@@ -545,17 +551,18 @@ class FaceGallery(BaseFaceGallery):
 
         return patient_loaded or doctor_loaded
 
-    def resolve_track_subject_role(self, participant: rtc.RemoteParticipant | None) -> str | None:
+    def resolve_track_subject(self, participant: rtc.RemoteParticipant | None) -> tuple[str | None, int | None]:
         if participant is None:
-            return None
+            return None, None
 
         metadata_raw = getattr(participant, "metadata", None)
+        role_from_metadata: str | None = None
         if isinstance(metadata_raw, str) and metadata_raw.strip() != "":
             try:
                 metadata = json.loads(metadata_raw)
-                role_from_metadata = str(metadata.get("role", "")).strip().lower()
-                if role_from_metadata in {"doctor", "patient"}:
-                    return role_from_metadata
+                metadata_role_candidate = str(metadata.get("role", "")).strip().lower()
+                if metadata_role_candidate in {"doctor", "patient"}:
+                    role_from_metadata = metadata_role_candidate
             except json.JSONDecodeError:
                 logger.debug("Unable to decode participant metadata JSON for participant %s", getattr(participant, "identity", "unknown"))
 
@@ -569,13 +576,19 @@ class FaceGallery(BaseFaceGallery):
         elif identity.isdigit():
             user_id = int(identity)
 
+        if role_from_metadata in {"patient", "doctor"}:
+            if user_id is None:
+                user_id = self.patient_id if role_from_metadata == "patient" else self.doctor_id
+
+            return role_from_metadata, user_id
+
         if user_id is not None:
             if self.patient_id is not None and user_id == self.patient_id:
-                return "patient"
+                return "patient", user_id
             if self.doctor_id is not None and user_id == self.doctor_id:
-                return "doctor"
+                return "doctor", user_id
 
-        return None
+        return None, user_id
 
 
 class PipelineManager:
@@ -920,6 +933,43 @@ async def post_internal_json(session: aiohttp.ClientSession, url: str, payload: 
         return False
 
 
+async def claim_due_microcheck(
+    session: aiohttp.ClientSession,
+    consultation_id: int,
+    user_id: int | None,
+    verified_role: str | None,
+) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {
+        "consultation_id": consultation_id,
+    }
+
+    if user_id is not None and verified_role in {"patient", "doctor"}:
+        payload["user_id"] = user_id
+        payload["verified_role"] = verified_role
+
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+    try:
+        async with session.post(
+            build_internal_url("microchecks/claim"),
+            data=body.encode("utf-8"),
+            headers=build_pipeline_signature_headers(body),
+        ) as response:
+            if response.status != 200:
+                response_text = await response.text()
+                logger.warning(
+                    "Microcheck claim endpoint returned HTTP %s body=%s",
+                    response.status,
+                    response_text[:500],
+                )
+                return None
+
+            return await response.json()
+    except Exception as error:
+        logger.error("Failed to claim microcheck for consultation %s: %s", consultation_id, error)
+        return None
+
+
 async def send_frame_results(session: aiohttp.ClientSession, payload: dict[str, Any]) -> None:
     try:
         async with session.post(LARAVEL_ENDPOINT, json=payload) as response:
@@ -958,25 +1008,27 @@ async def video_track_handler(
         await gallery.load_for_room(ctx.room.name, http_session, active_pipeline)
 
         participant_identity = str(getattr(participant, "identity", "unknown"))
-        inferred_role = gallery.resolve_track_subject_role(participant)
+        inferred_role, inferred_user_id = gallery.resolve_track_subject(participant)
         configured_target = VERIFICATION_TARGET if VERIFICATION_TARGET in {"patient", "doctor", "both"} else "both"
         target_role: str | None
 
         if PARTICIPANT_AWARE_VERIFICATION and inferred_role in {"patient", "doctor"}:
             target_role = inferred_role
             logger.info(
-                "Participant-aware verification: identity=%s inferred_role=%s",
+                "Participant-aware verification: identity=%s inferred_role=%s inferred_user_id=%s",
                 participant_identity,
                 inferred_role,
+                inferred_user_id,
             )
         else:
             target_role = configured_target
             logger.info(
-                "Fallback verification target: identity=%s target=%s participant_aware=%s inferred_role=%s",
+                "Fallback verification target: identity=%s target=%s participant_aware=%s inferred_role=%s inferred_user_id=%s",
                 participant_identity,
                 configured_target,
                 PARTICIPANT_AWARE_VERIFICATION,
                 inferred_role,
+                inferred_user_id,
             )
 
         should_report_deepfake = should_report_deepfake_for_role(inferred_role)
@@ -1094,8 +1146,38 @@ async def video_track_handler(
                     asyncio.create_task(send_face_match_result(http_session, doctor_report))
 
             if should_report_deepfake and gallery.consultation_id is not None and deepfake_results:
+                claim_role = inferred_role if inferred_role in {"patient", "doctor"} else None
+                claim_user_id = inferred_user_id if claim_role is not None and inferred_user_id is not None else None
+
+                claim_response = await claim_due_microcheck(
+                    http_session,
+                    consultation_id=gallery.consultation_id,
+                    user_id=claim_user_id,
+                    verified_role=claim_role,
+                )
+
+                if claim_user_id is None or claim_role is None:
+                    logger.debug(
+                        "Skipping deepfake scan submission due to unresolved participant identity. consultation_id=%s track=%s",
+                        gallery.consultation_id,
+                        track.sid,
+                    )
+                    continue
+
+                if claim_response is None or not claim_response.get("claimed"):
+                    continue
+
+                microcheck_payload = claim_response.get("microcheck") or {}
+                microcheck_id = microcheck_payload.get("id")
+                if not isinstance(microcheck_id, int):
+                    logger.warning("Claimed microcheck payload missing numeric id for consultation %s", gallery.consultation_id)
+                    continue
+
                 deepfake_scan_payload = build_scan_result_payload(
                     consultation_id=gallery.consultation_id,
+                    microcheck_id=microcheck_id,
+                    user_id=claim_user_id,
+                    verified_role=claim_role,
                     deepfake_result=deepfake_results,
                     frame_path=frame_filename,
                     frame_number=analyzed_frame_number,
