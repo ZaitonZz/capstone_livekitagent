@@ -23,6 +23,7 @@ from deepfakebench_effnet import (
     aggregate_fake_scores,
     crop_face_regions,
 )
+from deepfakebench_ucf import DeepfakeBenchUCFAdapter, DeepfakeBenchUCFConfig
 from dotenv import load_dotenv
 from face_recognition import FaceGallery as BaseFaceGallery, cosine_similarity, normalize_embedding
 from livekit import rtc
@@ -47,6 +48,42 @@ def read_positive_int_env(name: str, default: int) -> int:
     return parsed_value if parsed_value > 0 else default
 
 
+def read_optional_int_env(name: str) -> int | None:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return None
+
+    try:
+        return int(raw_value.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def read_optional_float_env(name: str) -> float | None:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return None
+
+    try:
+        return float(raw_value.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def read_bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    return default
+
+
 LARAVEL_BASE_URL = os.getenv("LARAVEL_BASE_URL", "http://localhost:8000").rstrip("/")
 LARAVEL_ENDPOINT = os.getenv("LARAVEL_ENDPOINT", f"{LARAVEL_BASE_URL}/api/frame-results")
 PIPELINE_INTERNAL_BASE_URL = os.getenv(
@@ -60,10 +97,13 @@ VIDEO_STREAM_CAPACITY = read_positive_int_env("VIDEO_STREAM_CAPACITY", 1)
 FRAME_ANALYSIS_MAX_WORKERS = read_positive_int_env("FRAME_ANALYSIS_MAX_WORKERS", 1)
 FACE_MATCH_STREAK_TARGET = int(os.getenv("FACE_MATCH_STREAK_TARGET", "3"))
 SAVED_FRAMES_DIR = os.getenv("SAVED_FRAMES_DIR", "saved_frames")
-REPORT_MISSING_REFERENCE_AS_FLAG = os.getenv("REPORT_MISSING_REFERENCE_AS_FLAG", "true").lower() == "true"
+REPORT_MISSING_REFERENCE_AS_FLAG = read_bool_env("REPORT_MISSING_REFERENCE_AS_FLAG", True)
 VERIFICATION_TARGET = os.getenv("VERIFICATION_TARGET", "both").strip().lower()
-PARTICIPANT_AWARE_VERIFICATION = os.getenv("PARTICIPANT_AWARE_VERIFICATION", "true").strip().lower() == "true"
+PARTICIPANT_AWARE_VERIFICATION = read_bool_env("PARTICIPANT_AWARE_VERIFICATION", True)
 DEEPFAKE_MODEL_BACKEND = os.getenv("DEEPFAKE_MODEL_BACKEND", "deepfakebench_effnb4").strip().lower()
+DEEPFAKE_FALLBACK_BACKEND = os.getenv("DEEPFAKE_FALLBACK_BACKEND", "deepfakebench_effnb4").strip().lower()
+DEEPFAKE_BACKEND_STRICT = read_bool_env("DEEPFAKE_BACKEND_STRICT", False)
+DEEPFAKE_AUTO_CORRECT_FAKE_CLASS_INDEX = read_bool_env("DEEPFAKE_AUTO_CORRECT_FAKE_CLASS_INDEX", False)
 DEEPFAKE_WEIGHTS_DIR = os.getenv("DEEPFAKE_WEIGHTS_DIR", os.path.join(BASE_DIR, "models", "deepfakebench"))
 DEEPFAKE_MODEL_PATH = os.getenv("DEEPFAKE_MODEL_PATH", os.path.join(DEEPFAKE_WEIGHTS_DIR, "effnb4_best.pth"))
 DEEPFAKE_BACKBONE_PATH = os.getenv(
@@ -78,20 +118,32 @@ DEEPFAKE_BACKBONE_URL = os.getenv(
     "DEEPFAKE_BACKBONE_URL",
     "https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/efficientnet-b4-6ed6700e.pth",
 )
-DEEPFAKE_AUTO_DOWNLOAD = os.getenv("DEEPFAKE_AUTO_DOWNLOAD", "true").strip().lower() == "true"
-DEEPFAKE_PREFER_CPU = os.getenv("DEEPFAKE_PREFER_CPU", "true").strip().lower() == "true"
+DEEPFAKE_AUTO_DOWNLOAD = read_bool_env("DEEPFAKE_AUTO_DOWNLOAD", True)
+DEEPFAKE_PREFER_CPU = read_bool_env("DEEPFAKE_PREFER_CPU", True)
 DEEPFAKE_MODEL_VERSION = os.getenv("DEEPFAKE_MODEL_VERSION", "deepfakebench_effnb4")
 DEEPFAKE_INPUT_SIZE = int(os.getenv("DEEPFAKE_INPUT_SIZE", "256"))
 DEEPFAKE_FAKE_THRESHOLD = float(os.getenv("DEEPFAKE_FAKE_THRESHOLD", "0.5"))
 DEEPFAKE_INCONCLUSIVE_MARGIN = float(os.getenv("DEEPFAKE_INCONCLUSIVE_MARGIN", "0.05"))
 # DeepfakeBench train_config label_dict maps fake->1 and real->0.
 DEEPFAKE_FAKE_CLASS_INDEX = int(os.getenv("DEEPFAKE_FAKE_CLASS_INDEX", "1"))
-DEEPFAKE_USE_FACE_CROPS = os.getenv("DEEPFAKE_USE_FACE_CROPS", "true").strip().lower() == "true"
-DEEPFAKE_FULL_FRAME_FALLBACK = os.getenv("DEEPFAKE_FULL_FRAME_FALLBACK", "false").strip().lower() == "true"
+DEEPFAKE_USE_FACE_CROPS = read_bool_env("DEEPFAKE_USE_FACE_CROPS", True)
+DEEPFAKE_FULL_FRAME_FALLBACK = read_bool_env("DEEPFAKE_FULL_FRAME_FALLBACK", False)
 DEEPFAKE_FACE_MARGIN_RATIO = float(os.getenv("DEEPFAKE_FACE_MARGIN_RATIO", "0.25"))
 DEEPFAKE_MIN_FACE_SIZE = int(os.getenv("DEEPFAKE_MIN_FACE_SIZE", "48"))
 DEEPFAKE_SCORE_AGGREGATION = os.getenv("DEEPFAKE_SCORE_AGGREGATION", "max").strip().lower()
 DEEPFAKE_REPORTING_ROLE = os.getenv("DEEPFAKE_REPORTING_ROLE", "both").strip().lower()
+
+DEEPFAKE_UCF_MODEL_PATH = os.getenv("DEEPFAKE_UCF_MODEL_PATH", os.path.join(DEEPFAKE_WEIGHTS_DIR, "ucf_effnb4_best.pth"))
+DEEPFAKE_UCF_MODEL_URL = os.getenv("DEEPFAKE_UCF_MODEL_URL", "")
+DEEPFAKE_UCF_BACKBONE_PATH = os.getenv("DEEPFAKE_UCF_BACKBONE_PATH", DEEPFAKE_BACKBONE_PATH)
+DEEPFAKE_UCF_BACKBONE_URL = os.getenv("DEEPFAKE_UCF_BACKBONE_URL", DEEPFAKE_BACKBONE_URL)
+DEEPFAKE_UCF_MODEL_VERSION = os.getenv("DEEPFAKE_UCF_MODEL_VERSION", "deepfakebench_ucf_effnb4")
+DEEPFAKE_UCF_INPUT_SIZE = int(os.getenv("DEEPFAKE_UCF_INPUT_SIZE", str(DEEPFAKE_INPUT_SIZE)))
+DEEPFAKE_UCF_ENCODER_FEAT_DIM = int(os.getenv("DEEPFAKE_UCF_ENCODER_FEAT_DIM", "512"))
+DEEPFAKE_UCF_FAKE_CLASS_INDEX = read_optional_int_env("DEEPFAKE_UCF_FAKE_CLASS_INDEX")
+DEEPFAKE_UCF_FAKE_THRESHOLD = read_optional_float_env("DEEPFAKE_UCF_FAKE_THRESHOLD")
+
+SUPPORTED_DEEPFAKE_BACKENDS = {"deepfakebench_effnb4", "deepfakebench_ucf"}
 
 
 def build_pipeline_signature_headers(body: str = "") -> dict[str, str]:
@@ -118,15 +170,58 @@ def resolve_asset_url(url: str) -> str:
     return urljoin(f"{LARAVEL_BASE_URL}/", url.lstrip("/"))
 
 
-def determine_deepfake_result(fake_score: float) -> tuple[str, float]:
+def resolve_deepfake_backend(requested_backend: str, fallback_backend: str, strict_mode: bool) -> tuple[str, bool]:
+    normalized_requested = requested_backend.strip().lower()
+    normalized_fallback = fallback_backend.strip().lower()
+
+    if normalized_requested in SUPPORTED_DEEPFAKE_BACKENDS:
+        return normalized_requested, False
+
+    if strict_mode:
+        return normalized_requested, True
+
+    if normalized_fallback in SUPPORTED_DEEPFAKE_BACKENDS:
+        return normalized_fallback, True
+
+    return "deepfakebench_effnb4", True
+
+
+def resolve_fake_class_index_for_backend(
+    backend: str,
+    default_index: int,
+    backend_override: int | None,
+    auto_correct: bool,
+) -> int:
+    if backend_override is not None:
+        return backend_override
+
+    if backend == "deepfakebench_effnb4" and auto_correct and default_index != 1:
+        return 1
+
+    return default_index
+
+
+def determine_deepfake_result_with_threshold(
+    fake_score: float,
+    threshold: float,
+    inconclusive_margin: float,
+) -> tuple[str, float]:
     bounded_score = max(0.0, min(1.0, float(fake_score)))
-    if abs(bounded_score - DEEPFAKE_FAKE_THRESHOLD) <= DEEPFAKE_INCONCLUSIVE_MARGIN:
+    if abs(bounded_score - threshold) <= inconclusive_margin:
         return "inconclusive", max(bounded_score, 1.0 - bounded_score)
 
-    if bounded_score >= DEEPFAKE_FAKE_THRESHOLD:
+    if bounded_score >= threshold:
         return "fake", bounded_score
 
     return "real", 1.0 - bounded_score
+
+
+def determine_deepfake_result(fake_score: float) -> tuple[str, float]:
+    return determine_deepfake_result_with_threshold(
+        fake_score=fake_score,
+        threshold=DEEPFAKE_FAKE_THRESHOLD,
+        inconclusive_margin=DEEPFAKE_INCONCLUSIVE_MARGIN,
+    )
 
 
 def normalize_track_id(track_id: str) -> str:
@@ -605,34 +700,77 @@ class PipelineManager:
         self.face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
         logger.info("InsightFace loaded successfully.")
 
-        if DEEPFAKE_MODEL_BACKEND != "deepfakebench_effnb4":
-            logger.warning(
-                "Unsupported deepfake backend '%s', falling back to deepfakebench_effnb4",
-                DEEPFAKE_MODEL_BACKEND,
-            )
-
         deepfake_device = torch.device("cpu")
         if not DEEPFAKE_PREFER_CPU and torch.cuda.is_available():
             deepfake_device = torch.device("cuda")
 
-        deepfake_config = DeepfakeBenchEfficientNetB4Config(
-            detector_checkpoint_path=DEEPFAKE_MODEL_PATH,
-            detector_checkpoint_url=DEEPFAKE_MODEL_URL,
-            backbone_weights_path=DEEPFAKE_BACKBONE_PATH,
-            backbone_weights_url=DEEPFAKE_BACKBONE_URL,
-            model_version=DEEPFAKE_MODEL_VERSION,
-            auto_download=DEEPFAKE_AUTO_DOWNLOAD,
-            input_size=DEEPFAKE_INPUT_SIZE,
+        requested_backend = DEEPFAKE_MODEL_BACKEND
+        resolved_backend, used_fallback_backend = resolve_deepfake_backend(
+            requested_backend=DEEPFAKE_MODEL_BACKEND,
+            fallback_backend=DEEPFAKE_FALLBACK_BACKEND,
+            strict_mode=DEEPFAKE_BACKEND_STRICT,
         )
-        self.deepfake_adapter = DeepfakeBenchEfficientNetB4Adapter(
-            config=deepfake_config,
-            device=deepfake_device,
-            logger=logger,
+
+        if used_fallback_backend and resolved_backend != requested_backend:
+            logger.warning(
+                "Deepfake backend '%s' is not supported. Falling back to '%s'.",
+                requested_backend,
+                resolved_backend,
+            )
+
+        (
+            self.deepfake_adapter,
+            self.deepfake_backend,
+            self.deepfake_detector_name,
+            self.deepfake_model_version,
+            self.deepfake_fake_threshold,
+            self.deepfake_fake_class_index,
+        ) = self._build_deepfake_adapter_for_backend(resolved_backend, deepfake_device)
+
+        if (
+            not self.deepfake_adapter.is_loaded
+            and not DEEPFAKE_BACKEND_STRICT
+            and self.deepfake_backend != "deepfakebench_effnb4"
+        ):
+            logger.warning(
+                "Deepfake backend '%s' failed to initialize. Trying fallback backend 'deepfakebench_effnb4'.",
+                self.deepfake_backend,
+            )
+            (
+                self.deepfake_adapter,
+                self.deepfake_backend,
+                self.deepfake_detector_name,
+                self.deepfake_model_version,
+                self.deepfake_fake_threshold,
+                self.deepfake_fake_class_index,
+            ) = self._build_deepfake_adapter_for_backend("deepfakebench_effnb4", deepfake_device)
+
+        if self.deepfake_backend == "deepfakebench_effnb4" and DEEPFAKE_FAKE_CLASS_INDEX != 1:
+            if DEEPFAKE_AUTO_CORRECT_FAKE_CLASS_INDEX:
+                logger.warning(
+                    "Auto-corrected DEEPFAKE_FAKE_CLASS_INDEX from %s to %s for backend %s.",
+                    DEEPFAKE_FAKE_CLASS_INDEX,
+                    self.deepfake_fake_class_index,
+                    self.deepfake_backend,
+                )
+            else:
+                logger.warning(
+                    "DEEPFAKE_FAKE_CLASS_INDEX is %s for backend %s. DeepfakeBench label mapping is usually fake=1 and real=0.",
+                    DEEPFAKE_FAKE_CLASS_INDEX,
+                    self.deepfake_backend,
+                )
+
+        logger.info(
+            "Deepfake backend active: requested=%s active=%s model=%s version=%s",
+            DEEPFAKE_MODEL_BACKEND,
+            self.deepfake_backend,
+            self.deepfake_detector_name,
+            self.deepfake_model_version,
         )
         logger.info(
             "Deepfake config: fake_class_index=%s threshold=%.3f face_crops=%s full_frame_fallback=%s aggregation=%s",
-            DEEPFAKE_FAKE_CLASS_INDEX,
-            DEEPFAKE_FAKE_THRESHOLD,
+            self.deepfake_fake_class_index,
+            self.deepfake_fake_threshold,
             DEEPFAKE_USE_FACE_CROPS,
             DEEPFAKE_FULL_FRAME_FALLBACK,
             DEEPFAKE_SCORE_AGGREGATION,
@@ -641,18 +779,98 @@ class PipelineManager:
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=FRAME_ANALYSIS_MAX_WORKERS)
         logger.info("Frame analysis executor max_workers=%s", FRAME_ANALYSIS_MAX_WORKERS)
 
+    def _build_deepfake_adapter_for_backend(
+        self,
+        backend: str,
+        deepfake_device: "torch.device",
+    ) -> tuple[Any, str, str, str, float, int]:
+        if backend == "deepfakebench_effnb4":
+            fake_class_index = resolve_fake_class_index_for_backend(
+                backend=backend,
+                default_index=DEEPFAKE_FAKE_CLASS_INDEX,
+                backend_override=None,
+                auto_correct=DEEPFAKE_AUTO_CORRECT_FAKE_CLASS_INDEX,
+            )
+            effnet_config = DeepfakeBenchEfficientNetB4Config(
+                detector_checkpoint_path=DEEPFAKE_MODEL_PATH,
+                detector_checkpoint_url=DEEPFAKE_MODEL_URL,
+                backbone_weights_path=DEEPFAKE_BACKBONE_PATH,
+                backbone_weights_url=DEEPFAKE_BACKBONE_URL,
+                model_version=DEEPFAKE_MODEL_VERSION,
+                auto_download=DEEPFAKE_AUTO_DOWNLOAD,
+                input_size=DEEPFAKE_INPUT_SIZE,
+            )
+            adapter = DeepfakeBenchEfficientNetB4Adapter(
+                config=effnet_config,
+                device=deepfake_device,
+                logger=logger,
+            )
+            return (
+                adapter,
+                backend,
+                "DeepfakeBench-EfficientNetB4",
+                DEEPFAKE_MODEL_VERSION,
+                DEEPFAKE_FAKE_THRESHOLD,
+                fake_class_index,
+            )
+
+        if backend == "deepfakebench_ucf":
+            fake_threshold = DEEPFAKE_UCF_FAKE_THRESHOLD if DEEPFAKE_UCF_FAKE_THRESHOLD is not None else DEEPFAKE_FAKE_THRESHOLD
+            fake_class_index = resolve_fake_class_index_for_backend(
+                backend=backend,
+                default_index=DEEPFAKE_FAKE_CLASS_INDEX,
+                backend_override=DEEPFAKE_UCF_FAKE_CLASS_INDEX,
+                auto_correct=False,
+            )
+            ucf_config = DeepfakeBenchUCFConfig(
+                detector_checkpoint_path=DEEPFAKE_UCF_MODEL_PATH,
+                detector_checkpoint_url=DEEPFAKE_UCF_MODEL_URL,
+                backbone_weights_path=DEEPFAKE_UCF_BACKBONE_PATH,
+                backbone_weights_url=DEEPFAKE_UCF_BACKBONE_URL,
+                model_version=DEEPFAKE_UCF_MODEL_VERSION,
+                auto_download=DEEPFAKE_AUTO_DOWNLOAD,
+                input_size=DEEPFAKE_UCF_INPUT_SIZE,
+                encoder_feat_dim=DEEPFAKE_UCF_ENCODER_FEAT_DIM,
+                num_classes=2,
+                dropout=0.0,
+            )
+            adapter = DeepfakeBenchUCFAdapter(
+                config=ucf_config,
+                device=deepfake_device,
+                logger=logger,
+            )
+            return (
+                adapter,
+                backend,
+                "DeepfakeBench-UCF",
+                DEEPFAKE_UCF_MODEL_VERSION,
+                fake_threshold,
+                fake_class_index,
+            )
+
+        if DEEPFAKE_BACKEND_STRICT:
+            raise ValueError(
+                f"Unsupported deepfake backend '{backend}' in strict mode. Supported backends: {sorted(SUPPORTED_DEEPFAKE_BACKENDS)}"
+            )
+
+        logger.warning(
+            "Unsupported deepfake backend '%s'. Defaulting to deepfakebench_effnb4.",
+            backend,
+        )
+        return self._build_deepfake_adapter_for_backend("deepfakebench_effnb4", deepfake_device)
+
     def _infer_deepfake_from_frame(
         self,
         rgb_data_array: np.ndarray,
         face_boxes: list[list[float]] | None = None,
     ) -> dict[str, Any]:
         start_time = time.time()
-        detector_model_name = "DeepfakeBench-EfficientNetB4"
+        detector_model_name = self.deepfake_detector_name
 
         if not self.deepfake_adapter.is_loaded:
             return {
                 "model": detector_model_name,
-                "model_version": DEEPFAKE_MODEL_VERSION,
+                "model_version": self.deepfake_model_version,
                 "result": "inconclusive",
                 "fake_score": None,
                 "confidence_score": 0.0,
@@ -686,8 +904,8 @@ class PipelineManager:
                     continue
 
                 selected_index = (
-                    DEEPFAKE_FAKE_CLASS_INDEX
-                    if 0 <= DEEPFAKE_FAKE_CLASS_INDEX < len(probabilities)
+                    self.deepfake_fake_class_index
+                    if 0 <= self.deepfake_fake_class_index < len(probabilities)
                     else len(probabilities) - 1
                 )
                 selected_scores.append(float(probabilities[selected_index]))
@@ -705,7 +923,11 @@ class PipelineManager:
                 else None
             )
 
-            result, confidence_score = determine_deepfake_result(fake_score)
+            result, confidence_score = determine_deepfake_result_with_threshold(
+                fake_score=fake_score,
+                threshold=self.deepfake_fake_threshold,
+                inconclusive_margin=DEEPFAKE_INCONCLUSIVE_MARGIN,
+            )
             logger.info(
                 "Deepfake inference: result=%s fake_score=%.4f alternate_score=%s confidence=%.4f regions=%s aggregation=%s fake_class_index=%s",
                 result,
@@ -714,19 +936,19 @@ class PipelineManager:
                 confidence_score,
                 len(selected_scores),
                 DEEPFAKE_SCORE_AGGREGATION,
-                DEEPFAKE_FAKE_CLASS_INDEX,
+                self.deepfake_fake_class_index,
             )
 
             return {
                 "model": detector_model_name,
-                "model_version": DEEPFAKE_MODEL_VERSION,
+                "model_version": self.deepfake_model_version,
                 "result": result,
                 "fake_score": round(fake_score, 4),
                 "alternate_score": None if alternate_score is None else round(alternate_score, 4),
                 "confidence_score": round(confidence_score, 4),
                 "flagged": result == "fake",
                 "faces_evaluated": len(selected_scores),
-                "fake_class_index": DEEPFAKE_FAKE_CLASS_INDEX,
+                "fake_class_index": self.deepfake_fake_class_index,
                 "score_aggregation": DEEPFAKE_SCORE_AGGREGATION,
                 "inference_time_ms": int((time.time() - start_time) * 1000),
             }
@@ -734,7 +956,7 @@ class PipelineManager:
             logger.exception("Deepfake inference failed: %s", error)
             return {
                 "model": detector_model_name,
-                "model_version": DEEPFAKE_MODEL_VERSION,
+                "model_version": self.deepfake_model_version,
                 "result": "inconclusive",
                 "fake_score": None,
                 "confidence_score": 0.0,

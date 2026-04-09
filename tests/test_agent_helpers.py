@@ -7,7 +7,10 @@ from agent import (
     build_saved_frame_filename,
     build_scan_result_payload,
     determine_deepfake_result,
+    determine_deepfake_result_with_threshold,
     read_positive_int_env,
+    resolve_deepfake_backend,
+    resolve_fake_class_index_for_backend,
     should_analyze_frame_timestamp,
     should_report_deepfake_for_role,
 )
@@ -45,6 +48,30 @@ class AgentHelperFunctionsTest(unittest.TestCase):
 
         self.assertEqual(result, "real")
         self.assertAlmostEqual(confidence, 0.9, places=4)
+
+    def test_determine_deepfake_result_with_threshold_respects_inconclusive_margin(self) -> None:
+        result_equal, confidence_equal = determine_deepfake_result_with_threshold(
+            fake_score=0.5,
+            threshold=0.5,
+            inconclusive_margin=0.05,
+        )
+        result_high, confidence_high = determine_deepfake_result_with_threshold(
+            fake_score=0.56,
+            threshold=0.5,
+            inconclusive_margin=0.05,
+        )
+        result_low, confidence_low = determine_deepfake_result_with_threshold(
+            fake_score=0.44,
+            threshold=0.5,
+            inconclusive_margin=0.05,
+        )
+
+        self.assertEqual(result_equal, "inconclusive")
+        self.assertAlmostEqual(confidence_equal, 0.5, places=4)
+        self.assertEqual(result_high, "fake")
+        self.assertAlmostEqual(confidence_high, 0.56, places=4)
+        self.assertEqual(result_low, "real")
+        self.assertAlmostEqual(confidence_low, 0.56, places=4)
 
     def test_build_scan_result_payload_uses_expected_keys(self) -> None:
         payload = build_scan_result_payload(
@@ -183,6 +210,56 @@ class AgentHelperFunctionsTest(unittest.TestCase):
                 "regions: 0",
             ],
         )
+
+    def test_resolve_deepfake_backend_prefers_supported_requested_backend(self) -> None:
+        resolved_backend, used_fallback = resolve_deepfake_backend(
+            requested_backend="deepfakebench_ucf",
+            fallback_backend="deepfakebench_effnb4",
+            strict_mode=False,
+        )
+
+        self.assertEqual(resolved_backend, "deepfakebench_ucf")
+        self.assertEqual(used_fallback, False)
+
+    def test_resolve_deepfake_backend_falls_back_when_requested_is_unsupported(self) -> None:
+        resolved_backend, used_fallback = resolve_deepfake_backend(
+            requested_backend="unknown-backend",
+            fallback_backend="deepfakebench_effnb4",
+            strict_mode=False,
+        )
+
+        self.assertEqual(resolved_backend, "deepfakebench_effnb4")
+        self.assertEqual(used_fallback, True)
+
+    def test_resolve_deepfake_backend_respects_strict_mode(self) -> None:
+        resolved_backend, used_fallback = resolve_deepfake_backend(
+            requested_backend="unknown-backend",
+            fallback_backend="deepfakebench_effnb4",
+            strict_mode=True,
+        )
+
+        self.assertEqual(resolved_backend, "unknown-backend")
+        self.assertEqual(used_fallback, True)
+
+    def test_resolve_fake_class_index_for_backend_applies_autocorrect_for_effnet(self) -> None:
+        resolved_class_index = resolve_fake_class_index_for_backend(
+            backend="deepfakebench_effnb4",
+            default_index=0,
+            backend_override=None,
+            auto_correct=True,
+        )
+
+        self.assertEqual(resolved_class_index, 1)
+
+    def test_resolve_fake_class_index_for_backend_uses_backend_override(self) -> None:
+        resolved_class_index = resolve_fake_class_index_for_backend(
+            backend="deepfakebench_ucf",
+            default_index=1,
+            backend_override=0,
+            auto_correct=False,
+        )
+
+        self.assertEqual(resolved_class_index, 0)
 
 
 if __name__ == "__main__":
