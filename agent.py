@@ -133,15 +133,21 @@ DEEPFAKE_MIN_FACE_SIZE = int(os.getenv("DEEPFAKE_MIN_FACE_SIZE", "48"))
 DEEPFAKE_SCORE_AGGREGATION = os.getenv("DEEPFAKE_SCORE_AGGREGATION", "max").strip().lower()
 DEEPFAKE_REPORTING_ROLE = os.getenv("DEEPFAKE_REPORTING_ROLE", "both").strip().lower()
 
-DEEPFAKE_UCF_MODEL_PATH = os.getenv("DEEPFAKE_UCF_MODEL_PATH", os.path.join(DEEPFAKE_WEIGHTS_DIR, "ucf_effnb4_best.pth"))
+DEEPFAKE_UCF_MODEL_PATH = os.getenv("DEEPFAKE_UCF_MODEL_PATH", os.path.join(DEEPFAKE_WEIGHTS_DIR, "ucf_best.pth"))
 DEEPFAKE_UCF_MODEL_URL = os.getenv("DEEPFAKE_UCF_MODEL_URL", "")
+DEEPFAKE_UCF_BACKBONE_NAME = os.getenv("DEEPFAKE_UCF_BACKBONE_NAME", "xception").strip().lower()
 DEEPFAKE_UCF_BACKBONE_PATH = os.getenv("DEEPFAKE_UCF_BACKBONE_PATH", DEEPFAKE_BACKBONE_PATH)
 DEEPFAKE_UCF_BACKBONE_URL = os.getenv("DEEPFAKE_UCF_BACKBONE_URL", DEEPFAKE_BACKBONE_URL)
-DEEPFAKE_UCF_MODEL_VERSION = os.getenv("DEEPFAKE_UCF_MODEL_VERSION", "deepfakebench_ucf_effnb4")
+DEEPFAKE_UCF_MODEL_VERSION = os.getenv("DEEPFAKE_UCF_MODEL_VERSION", "deepfakebench_ucf")
 DEEPFAKE_UCF_INPUT_SIZE = int(os.getenv("DEEPFAKE_UCF_INPUT_SIZE", str(DEEPFAKE_INPUT_SIZE)))
 DEEPFAKE_UCF_ENCODER_FEAT_DIM = int(os.getenv("DEEPFAKE_UCF_ENCODER_FEAT_DIM", "512"))
 DEEPFAKE_UCF_FAKE_CLASS_INDEX = read_optional_int_env("DEEPFAKE_UCF_FAKE_CLASS_INDEX")
 DEEPFAKE_UCF_FAKE_THRESHOLD = read_optional_float_env("DEEPFAKE_UCF_FAKE_THRESHOLD")
+
+if DEEPFAKE_UCF_BACKBONE_NAME in {"effnb4", "efficientnet", "efficientnet_b4", "efficientnet-b4"}:
+    DEEPFAKE_UCF_BACKBONE_NAME = "efficientnet-b4"
+else:
+    DEEPFAKE_UCF_BACKBONE_NAME = "xception"
 
 SUPPORTED_DEEPFAKE_BACKENDS = {"deepfakebench_effnb4", "deepfakebench_ucf"}
 
@@ -822,11 +828,22 @@ class PipelineManager:
                 backend_override=DEEPFAKE_UCF_FAKE_CLASS_INDEX,
                 auto_correct=False,
             )
+            ucf_backbone_weights_path = (
+                DEEPFAKE_UCF_BACKBONE_PATH
+                if DEEPFAKE_UCF_BACKBONE_NAME == "efficientnet-b4"
+                else None
+            )
+            ucf_backbone_weights_url = (
+                DEEPFAKE_UCF_BACKBONE_URL
+                if DEEPFAKE_UCF_BACKBONE_NAME == "efficientnet-b4"
+                else ""
+            )
             ucf_config = DeepfakeBenchUCFConfig(
                 detector_checkpoint_path=DEEPFAKE_UCF_MODEL_PATH,
                 detector_checkpoint_url=DEEPFAKE_UCF_MODEL_URL,
-                backbone_weights_path=DEEPFAKE_UCF_BACKBONE_PATH,
-                backbone_weights_url=DEEPFAKE_UCF_BACKBONE_URL,
+                backbone_name=DEEPFAKE_UCF_BACKBONE_NAME,
+                backbone_weights_path=ucf_backbone_weights_path,
+                backbone_weights_url=ucf_backbone_weights_url,
                 model_version=DEEPFAKE_UCF_MODEL_VERSION,
                 auto_download=DEEPFAKE_AUTO_DOWNLOAD,
                 input_size=DEEPFAKE_UCF_INPUT_SIZE,
@@ -842,7 +859,7 @@ class PipelineManager:
             return (
                 adapter,
                 backend,
-                "DeepfakeBench-UCF",
+                f"DeepfakeBench-UCF-{DEEPFAKE_UCF_BACKBONE_NAME}",
                 DEEPFAKE_UCF_MODEL_VERSION,
                 fake_threshold,
                 fake_class_index,
