@@ -150,6 +150,16 @@ else:
     DEEPFAKE_UCF_BACKBONE_NAME = "xception"
 
 SUPPORTED_DEEPFAKE_BACKENDS = {"deepfakebench_effnb4", "deepfakebench_ucf"}
+MICROCHECK_CLAIM_MAX_ATTEMPTS = read_positive_int_env("MICROCHECK_CLAIM_MAX_ATTEMPTS", 2)
+SCAN_RESULT_MAX_ATTEMPTS = read_positive_int_env("SCAN_RESULT_MAX_ATTEMPTS", 2)
+REQUEST_RETRY_BASE_DELAY_SECONDS = read_optional_float_env("REQUEST_RETRY_BASE_DELAY_SECONDS") or 0.35
+REQUEST_RETRY_MAX_DELAY_SECONDS = read_optional_float_env("REQUEST_RETRY_MAX_DELAY_SECONDS") or 1.0
+
+if REQUEST_RETRY_BASE_DELAY_SECONDS <= 0:
+    REQUEST_RETRY_BASE_DELAY_SECONDS = 0.35
+
+if REQUEST_RETRY_MAX_DELAY_SECONDS < REQUEST_RETRY_BASE_DELAY_SECONDS:
+    REQUEST_RETRY_MAX_DELAY_SECONDS = REQUEST_RETRY_BASE_DELAY_SECONDS
 
 
 def build_pipeline_signature_headers(body: str = "") -> dict[str, str]:
@@ -255,6 +265,137 @@ def should_analyze_frame_timestamp(
 
     interval_us = max(int(interval_seconds * 1_000_000), 0)
     return (current_timestamp_us - last_analyzed_timestamp_us) >= interval_us
+
+
+def compute_retry_delay_seconds(retry_index: int) -> float:
+    bounded_retry_index = max(retry_index, 0)
+    delay_seconds = REQUEST_RETRY_BASE_DELAY_SECONDS * (2 ** bounded_retry_index)
+    return min(delay_seconds, REQUEST_RETRY_MAX_DELAY_SECONDS)
+
+
+def should_retry_http_status(status_code: int) -> bool:
+    if status_code in {408, 429}:
+        return True
+
+    return 500 <= status_code < 600
+
+
+def has_active_track_handler(active_track_tasks: dict[str, asyncio.Task[Any]], track_sid: str) -> bool:
+    existing_task = active_track_tasks.get(track_sid)
+    return existing_task is not None and not existing_task.done()
+
+
+def list_remote_participants(room: Any) -> list[Any]:
+    participant_collection = getattr(room, "remote_participants", None)
+    if participant_collection is None:
+        participant_collection = getattr(room, "participants", None)
+
+    if participant_collection is None:
+        return []
+
+    if isinstance(participant_collection, dict):
+        return [participant for participant in participant_collection.values() if participant is not None]
+
+    if hasattr(participant_collection, "values"):
+        try:
+            values = participant_collection.values()
+            return [participant for participant in values if participant is not None]
+        except Exception:
+            pass
+
+    try:
+        return [participant for participant in participant_collection if participant is not None]
+    except TypeError:
+        return []
+
+
+def list_video_tracks_for_participant(participant: Any) -> list[Any]:
+    publication_candidates: list[Any] = []
+    for attribute_name in ("video_tracks", "track_publications", "tracks"):
+        publications = getattr(participant, attribute_name, None)
+        if publications is None:
+            continue
+
+        if isinstance(publications, dict):
+            publication_candidates.extend(publications.values())
+            continue
+
+        if hasattr(publications, "values"):
+            try:
+                publication_candidates.extend(publications.values())
+                continue
+            except Exception:
+                pass
+
+        try:
+            publication_candidates.extend(list(publications))
+        except TypeError:
+            publication_candidates.append(publications)
+
+    seen_track_sids: set[str] = set()
+    video_tracks: list[Any] = []
+
+    for publication in publication_candidates:
+        track = getattr(publication, "track", None)
+        if track is None and getattr(publication, "kind", None) == rtc.TrackKind.KIND_VIDEO:
+            track = publication
+
+        if track is None or getattr(track, "kind", None) != rtc.TrackKind.KIND_VIDEO:
+            continue
+
+        track_sid = str(getattr(track, "sid", "")).strip()
+        if track_sid == "" or track_sid in seen_track_sids:
+            continue
+
+        seen_track_sids.add(track_sid)
+        video_tracks.append(track)
+
+    return video_tracks
+
+
+def resolve_claim_subject_for_scan(
+    inferred_role: str | None,
+    inferred_user_id: int | None,
+    gallery: "FaceGallery",
+) -> tuple[str | None, int | None]:
+    if inferred_role not in {"patient", "doctor"}:
+        return None, None
+
+    if inferred_user_id is not None:
+        return inferred_role, inferred_user_id
+
+    fallback_user_id = gallery.patient_id if inferred_role == "patient" else gallery.doctor_id
+    if fallback_user_id is None:
+        return None, None
+
+    return inferred_role, fallback_user_id
+
+
+async def refresh_consultation_context_once(
+    gallery: "FaceGallery",
+    room_name: str,
+    session: aiohttp.ClientSession,
+    pipeline_manager: "PipelineManager",
+) -> bool:
+    if gallery.consultation_id is not None:
+        return True
+
+    logger.warning(
+        "Consultation id unresolved for room %s after initial load. Retrying once.",
+        room_name,
+    )
+    await gallery.load_for_room(room_name, session, pipeline_manager)
+
+    if gallery.consultation_id is None:
+        logger.error("Consultation id is still unresolved for room %s after retry", room_name)
+        return False
+
+    logger.info(
+        "Consultation id recovered for room %s consultation_id=%s",
+        room_name,
+        gallery.consultation_id,
+    )
+    return True
 
 
 def build_saved_frame_filename(consultation_id: int | None, frame_number: int, timestamp_us: int, track_id: str) -> str:
@@ -1152,6 +1293,15 @@ def get_or_create_pipeline() -> PipelineManager:
 
 
 async def post_internal_json(session: aiohttp.ClientSession, url: str, payload: dict[str, Any]) -> bool:
+    stored, _ = await post_internal_json_with_retryability(session, url, payload)
+    return stored
+
+
+async def post_internal_json_with_retryability(
+    session: aiohttp.ClientSession,
+    url: str,
+    payload: dict[str, Any],
+) -> tuple[bool, bool]:
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
     try:
@@ -1164,20 +1314,20 @@ async def post_internal_json(session: aiohttp.ClientSession, url: str, payload: 
                     response.status,
                     response_text[:500],
                 )
-                return False
+                return False, should_retry_http_status(response.status)
 
-            return True
+            return True, False
     except Exception as error:
         logger.error("Failed to post signed payload to %s: %s", url, error)
-        return False
+        return False, True
 
 
-async def claim_due_microcheck(
+async def _claim_due_microcheck_once(
     session: aiohttp.ClientSession,
     consultation_id: int,
     user_id: int | None,
     verified_role: str | None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, bool]:
     payload: dict[str, Any] = {
         "consultation_id": consultation_id,
     }
@@ -1201,12 +1351,65 @@ async def claim_due_microcheck(
                     response.status,
                     response_text[:500],
                 )
-                return None
+                return None, should_retry_http_status(response.status)
 
-            return await response.json()
+            return await response.json(), False
     except Exception as error:
         logger.error("Failed to claim microcheck for consultation %s: %s", consultation_id, error)
-        return None
+        return None, True
+
+
+async def claim_due_microcheck(
+    session: aiohttp.ClientSession,
+    consultation_id: int,
+    user_id: int | None,
+    verified_role: str | None,
+) -> dict[str, Any] | None:
+    claim_response, _ = await _claim_due_microcheck_once(
+        session,
+        consultation_id,
+        user_id,
+        verified_role,
+    )
+    return claim_response
+
+
+async def claim_due_microcheck_with_retry(
+    session: aiohttp.ClientSession,
+    consultation_id: int,
+    user_id: int,
+    verified_role: str,
+    max_attempts: int = MICROCHECK_CLAIM_MAX_ATTEMPTS,
+) -> dict[str, Any] | None:
+    safe_max_attempts = max(max_attempts, 1)
+
+    for attempt in range(1, safe_max_attempts + 1):
+        claim_response, retryable = await _claim_due_microcheck_once(
+            session,
+            consultation_id,
+            user_id,
+            verified_role,
+        )
+
+        if claim_response is not None:
+            return claim_response
+
+        if not retryable or attempt >= safe_max_attempts:
+            return None
+
+        retry_delay_seconds = compute_retry_delay_seconds(attempt - 1)
+        logger.info(
+            "Retrying microcheck claim in %.2fs (attempt %s/%s) consultation_id=%s role=%s user_id=%s",
+            retry_delay_seconds,
+            attempt + 1,
+            safe_max_attempts,
+            consultation_id,
+            verified_role,
+            user_id,
+        )
+        await asyncio.sleep(retry_delay_seconds)
+
+    return None
 
 
 async def send_frame_results(session: aiohttp.ClientSession, payload: dict[str, Any]) -> None:
@@ -1222,12 +1425,46 @@ async def send_face_match_result(session: aiohttp.ClientSession, payload: dict[s
     await post_internal_json(session, build_internal_url("face-match-results"), payload)
 
 
-async def send_scan_result(session: aiohttp.ClientSession, payload: dict[str, Any]) -> None:
-    await post_internal_json(session, build_internal_url("scan-results"), payload)
+async def send_scan_result(session: aiohttp.ClientSession, payload: dict[str, Any]) -> bool:
+    return await post_internal_json(session, build_internal_url("scan-results"), payload)
+
+
+async def send_scan_result_with_retry(
+    session: aiohttp.ClientSession,
+    payload: dict[str, Any],
+    max_attempts: int = SCAN_RESULT_MAX_ATTEMPTS,
+) -> bool:
+    safe_max_attempts = max(max_attempts, 1)
+
+    for attempt in range(1, safe_max_attempts + 1):
+        stored, retryable = await post_internal_json_with_retryability(
+            session,
+            build_internal_url("scan-results"),
+            payload,
+        )
+
+        if stored:
+            return True
+
+        if not retryable or attempt >= safe_max_attempts:
+            return False
+
+        retry_delay_seconds = compute_retry_delay_seconds(attempt - 1)
+        logger.info(
+            "Retrying deepfake scan submission in %.2fs (attempt %s/%s) consultation_id=%s microcheck_id=%s",
+            retry_delay_seconds,
+            attempt + 1,
+            safe_max_attempts,
+            payload.get("consultation_id"),
+            payload.get("microcheck_id"),
+        )
+        await asyncio.sleep(retry_delay_seconds)
+
+    return False
 
 
 async def video_track_handler(
-    track: rtc.RemoteVideoTrack,
+    track: rtc.Track,
     participant: rtc.RemoteParticipant | None,
     ctx: JobContext,
 ) -> None:
@@ -1245,6 +1482,7 @@ async def video_track_handler(
     async with aiohttp.ClientSession() as http_session:
         gallery = FaceGallery()
         await gallery.load_for_room(ctx.room.name, http_session, active_pipeline)
+        await refresh_consultation_context_once(gallery, ctx.room.name, http_session, active_pipeline)
 
         participant_identity = str(getattr(participant, "identity", "unknown"))
         inferred_role, inferred_user_id = gallery.resolve_track_subject(participant)
@@ -1384,26 +1622,67 @@ async def video_track_handler(
                 if doctor_report is not None:
                     asyncio.create_task(send_face_match_result(http_session, doctor_report))
 
-            if should_report_deepfake and gallery.consultation_id is not None and deepfake_results:
-                claim_role = inferred_role if inferred_role in {"patient", "doctor"} else None
-                claim_user_id = inferred_user_id if claim_role is not None and inferred_user_id is not None else None
+            if should_report_deepfake and deepfake_results:
+                if gallery.consultation_id is None:
+                    logger.warning(
+                        "Skipping deepfake scan submission because consultation id is unavailable. track=%s frame=%s",
+                        track.sid,
+                        analyzed_frame_number,
+                    )
+                    continue
 
-                claim_response = await claim_due_microcheck(
+                claim_role, claim_user_id = resolve_claim_subject_for_scan(
+                    inferred_role=inferred_role,
+                    inferred_user_id=inferred_user_id,
+                    gallery=gallery,
+                )
+
+                if claim_user_id is None or claim_role is None:
+                    logger.warning(
+                        (
+                            "Skipping deepfake scan submission due to unresolved participant identity. "
+                            "consultation_id=%s track=%s identity=%s inferred_role=%s inferred_user_id=%s "
+                            "patient_id=%s doctor_id=%s"
+                        ),
+                        gallery.consultation_id,
+                        track.sid,
+                        participant_identity,
+                        inferred_role,
+                        inferred_user_id,
+                        gallery.patient_id,
+                        gallery.doctor_id,
+                    )
+                    continue
+
+                claim_response = await claim_due_microcheck_with_retry(
                     http_session,
                     consultation_id=gallery.consultation_id,
                     user_id=claim_user_id,
                     verified_role=claim_role,
                 )
 
-                if claim_user_id is None or claim_role is None:
-                    logger.debug(
-                        "Skipping deepfake scan submission due to unresolved participant identity. consultation_id=%s track=%s",
+                if claim_response is None:
+                    logger.warning(
+                        (
+                            "Skipping deepfake scan submission because claim request failed after retries. "
+                            "consultation_id=%s track=%s role=%s user_id=%s"
+                        ),
                         gallery.consultation_id,
                         track.sid,
+                        claim_role,
+                        claim_user_id,
                     )
                     continue
 
-                if claim_response is None or not claim_response.get("claimed"):
+                if not claim_response.get("claimed"):
+                    logger.info(
+                        "No due microcheck available for claim. consultation_id=%s role=%s user_id=%s reason=%s next_scheduled_at=%s",
+                        gallery.consultation_id,
+                        claim_role,
+                        claim_user_id,
+                        claim_response.get("reason"),
+                        claim_response.get("next_scheduled_at"),
+                    )
                     continue
 
                 microcheck_payload = claim_response.get("microcheck") or {}
@@ -1421,7 +1700,21 @@ async def video_track_handler(
                     frame_path=frame_filename,
                     frame_number=analyzed_frame_number,
                 )
-                asyncio.create_task(send_scan_result(http_session, deepfake_scan_payload))
+                stored_scan_result = await send_scan_result_with_retry(
+                    http_session,
+                    deepfake_scan_payload,
+                )
+                if not stored_scan_result:
+                    logger.warning(
+                        (
+                            "Deepfake scan submission failed after retries. "
+                            "consultation_id=%s microcheck_id=%s track=%s frame=%s"
+                        ),
+                        gallery.consultation_id,
+                        microcheck_id,
+                        track.sid,
+                        analyzed_frame_number,
+                    )
 
 
 def prewarm(process: JobProcess) -> None:
@@ -1430,9 +1723,52 @@ def prewarm(process: JobProcess) -> None:
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    logger.info("Connected to room: %s", ctx.room.name)
+    active_track_tasks: dict[str, asyncio.Task[Any]] = {}
+    track_owner_identity: dict[str, str] = {}
 
-    await ctx.connect(auto_subscribe=AutoSubscribe.VIDEO_ONLY)
+    def schedule_video_track_handler(
+        track: rtc.Track,
+        participant: rtc.RemoteParticipant | None,
+        source: str,
+    ) -> bool:
+        if track.kind != rtc.TrackKind.KIND_VIDEO:
+            return False
+
+        track_sid = str(getattr(track, "sid", "")).strip()
+        if track_sid == "":
+            logger.warning("Skipping video track without SID source=%s", source)
+            return False
+
+        if has_active_track_handler(active_track_tasks, track_sid):
+            logger.info("Skipping duplicate video track handler for track=%s source=%s", track_sid, source)
+            return False
+
+        participant_identity = str(getattr(participant, "identity", "unknown"))
+        handler_task = asyncio.create_task(video_track_handler(track, participant, ctx))
+        active_track_tasks[track_sid] = handler_task
+        track_owner_identity[track_sid] = participant_identity
+        logger.info(
+            "Scheduled video track handler track=%s participant=%s source=%s",
+            track_sid,
+            participant_identity,
+            source,
+        )
+
+        def on_handler_done(done_task: asyncio.Task[Any], sid: str = track_sid, owner: str = participant_identity) -> None:
+            tracked_task = active_track_tasks.get(sid)
+            if tracked_task is done_task:
+                active_track_tasks.pop(sid, None)
+                track_owner_identity.pop(sid, None)
+
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                logger.info("Video track handler cancelled track=%s participant=%s", sid, owner)
+            except Exception:
+                logger.exception("Video track handler failed track=%s participant=%s", sid, owner)
+
+        handler_task.add_done_callback(on_handler_done)
+        return True
 
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(
@@ -1440,8 +1776,66 @@ async def entrypoint(ctx: JobContext) -> None:
         publication: rtc.RemoteTrackPublication,
         participant: rtc.RemoteParticipant,
     ) -> None:
-        if track.kind == rtc.TrackKind.KIND_VIDEO:
-            asyncio.create_task(video_track_handler(track, participant, ctx))
+        schedule_video_track_handler(track, participant, source="event:track_subscribed")
+
+    @ctx.room.on("track_unsubscribed")
+    def on_track_unsubscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        track_sid = str(getattr(track, "sid", "") or getattr(publication, "sid", "")).strip()
+        if track_sid == "":
+            return
+
+        existing_task = active_track_tasks.get(track_sid)
+        if existing_task is None or existing_task.done():
+            return
+
+        logger.info(
+            "Cancelling video track handler because track unsubscribed track=%s participant=%s",
+            track_sid,
+            getattr(participant, "identity", "unknown"),
+        )
+        existing_task.cancel()
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
+        participant_identity = str(getattr(participant, "identity", "")).strip()
+        if participant_identity == "":
+            return
+
+        for track_sid, owner_identity in list(track_owner_identity.items()):
+            if owner_identity != participant_identity:
+                continue
+
+            existing_task = active_track_tasks.get(track_sid)
+            if existing_task is None or existing_task.done():
+                continue
+
+            logger.info(
+                "Cancelling video track handler due to participant disconnect track=%s participant=%s",
+                track_sid,
+                participant_identity,
+            )
+            existing_task.cancel()
+
+    await ctx.connect(auto_subscribe=AutoSubscribe.VIDEO_ONLY)
+    logger.info("Connected to room: %s", ctx.room.name)
+
+    remote_participants = list_remote_participants(ctx.room)
+    scheduled_existing_tracks = 0
+    for remote_participant in remote_participants:
+        for existing_track in list_video_tracks_for_participant(remote_participant):
+            if schedule_video_track_handler(existing_track, remote_participant, source="bootstrap:existing-track"):
+                scheduled_existing_tracks += 1
+
+    logger.info(
+        "Existing-track bootstrap completed room=%s participants=%s scheduled_tracks=%s",
+        ctx.room.name,
+        len(remote_participants),
+        scheduled_existing_tracks,
+    )
 
     await asyncio.Future()
 

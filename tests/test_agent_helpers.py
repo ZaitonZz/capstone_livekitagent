@@ -1,17 +1,24 @@
 import unittest
 import os
 
+from tests._agent_import_stubs import install_agent_dependency_stubs
+
+install_agent_dependency_stubs()
+
 import agent
 from agent import (
     build_deepfake_overlay_lines,
     build_saved_frame_filename,
     build_scan_result_payload,
+    compute_retry_delay_seconds,
     determine_deepfake_result,
     determine_deepfake_result_with_threshold,
     read_positive_int_env,
     resolve_deepfake_backend,
     resolve_fake_class_index_for_backend,
+    resolve_claim_subject_for_scan,
     should_analyze_frame_timestamp,
+    should_retry_http_status,
     should_report_deepfake_for_role,
 )
 
@@ -260,6 +267,68 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         )
 
         self.assertEqual(resolved_class_index, 0)
+
+    def test_should_retry_http_status_flags_transient_statuses(self) -> None:
+        self.assertEqual(should_retry_http_status(408), True)
+        self.assertEqual(should_retry_http_status(429), True)
+        self.assertEqual(should_retry_http_status(500), True)
+        self.assertEqual(should_retry_http_status(503), True)
+
+    def test_should_retry_http_status_ignores_non_transient_statuses(self) -> None:
+        self.assertEqual(should_retry_http_status(400), False)
+        self.assertEqual(should_retry_http_status(401), False)
+        self.assertEqual(should_retry_http_status(422), False)
+
+    def test_compute_retry_delay_seconds_grows_and_caps(self) -> None:
+        original_base = agent.REQUEST_RETRY_BASE_DELAY_SECONDS
+        original_max = agent.REQUEST_RETRY_MAX_DELAY_SECONDS
+
+        try:
+            agent.REQUEST_RETRY_BASE_DELAY_SECONDS = 0.2
+            agent.REQUEST_RETRY_MAX_DELAY_SECONDS = 0.5
+
+            self.assertAlmostEqual(compute_retry_delay_seconds(0), 0.2, places=4)
+            self.assertAlmostEqual(compute_retry_delay_seconds(1), 0.4, places=4)
+            self.assertAlmostEqual(compute_retry_delay_seconds(3), 0.5, places=4)
+        finally:
+            agent.REQUEST_RETRY_BASE_DELAY_SECONDS = original_base
+            agent.REQUEST_RETRY_MAX_DELAY_SECONDS = original_max
+
+    def test_resolve_claim_subject_for_scan_prefers_inferred_user(self) -> None:
+        gallery = type("GalleryState", (), {"patient_id": 11, "doctor_id": 22})()
+
+        role, user_id = resolve_claim_subject_for_scan(
+            inferred_role="patient",
+            inferred_user_id=99,
+            gallery=gallery,
+        )
+
+        self.assertEqual(role, "patient")
+        self.assertEqual(user_id, 99)
+
+    def test_resolve_claim_subject_for_scan_falls_back_to_gallery_user(self) -> None:
+        gallery = type("GalleryState", (), {"patient_id": 11, "doctor_id": 22})()
+
+        role, user_id = resolve_claim_subject_for_scan(
+            inferred_role="doctor",
+            inferred_user_id=None,
+            gallery=gallery,
+        )
+
+        self.assertEqual(role, "doctor")
+        self.assertEqual(user_id, 22)
+
+    def test_resolve_claim_subject_for_scan_returns_none_without_role(self) -> None:
+        gallery = type("GalleryState", (), {"patient_id": 11, "doctor_id": 22})()
+
+        role, user_id = resolve_claim_subject_for_scan(
+            inferred_role=None,
+            inferred_user_id=11,
+            gallery=gallery,
+        )
+
+        self.assertIsNone(role)
+        self.assertIsNone(user_id)
 
 
 if __name__ == "__main__":
