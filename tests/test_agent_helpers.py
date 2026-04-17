@@ -10,6 +10,7 @@ import agent
 from agent import (
     ActiveConsultationRoom,
     PolledRoomWorkerState,
+    build_face_match_payload,
     build_deepfake_overlay_lines,
     build_saved_frame_filename,
     build_scan_result_payload,
@@ -114,6 +115,61 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         self.assertEqual(payload["model_version"], "efficientnet_v2_s")
         self.assertEqual(payload["flagged"], True)
         self.assertIn("scanned_at", payload)
+
+    def test_build_face_match_payload_marks_explicit_match(self) -> None:
+        payload = build_face_match_payload(
+            consultation_id=51,
+            microcheck_id=7,
+            user_id=103,
+            verified_role="patient",
+            recognition_result={
+                "reference_loaded": True,
+                "matched": True,
+                "best_similarity": 0.81234,
+            },
+        )
+
+        self.assertEqual(payload["consultation_id"], 51)
+        self.assertEqual(payload["microcheck_id"], 7)
+        self.assertEqual(payload["user_id"], 103)
+        self.assertEqual(payload["verified_role"], "patient")
+        self.assertEqual(payload["matched"], True)
+        self.assertEqual(payload["face_match_score"], 0.8123)
+        self.assertEqual(payload["flagged"], False)
+
+    def test_build_face_match_payload_marks_explicit_failure(self) -> None:
+        payload = build_face_match_payload(
+            consultation_id=19,
+            microcheck_id=23,
+            user_id=88,
+            verified_role="doctor",
+            recognition_result={
+                "reference_loaded": True,
+                "matched": False,
+                "best_similarity": 0.21999,
+            },
+        )
+
+        self.assertEqual(payload["matched"], False)
+        self.assertEqual(payload["face_match_score"], 0.22)
+        self.assertEqual(payload["flagged"], True)
+
+    def test_build_face_match_payload_uses_non_failure_fallback_for_non_explicit_result(self) -> None:
+        payload = build_face_match_payload(
+            consultation_id=19,
+            microcheck_id=23,
+            user_id=88,
+            verified_role="doctor",
+            recognition_result={
+                "reference_loaded": False,
+                "matched": None,
+                "best_similarity": None,
+            },
+        )
+
+        self.assertEqual(payload["matched"], False)
+        self.assertEqual(payload["face_match_score"], 0.0)
+        self.assertEqual(payload["flagged"], False)
 
     def test_should_report_deepfake_for_role_when_mode_is_patient(self) -> None:
         original = agent.DEEPFAKE_REPORTING_ROLE

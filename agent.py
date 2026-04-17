@@ -153,6 +153,7 @@ else:
 SUPPORTED_DEEPFAKE_BACKENDS = {"deepfakebench_effnb4", "deepfakebench_ucf"}
 MICROCHECK_CLAIM_MAX_ATTEMPTS = read_positive_int_env("MICROCHECK_CLAIM_MAX_ATTEMPTS", 2)
 SCAN_RESULT_MAX_ATTEMPTS = read_positive_int_env("SCAN_RESULT_MAX_ATTEMPTS", 2)
+FACE_MATCH_RESULT_MAX_ATTEMPTS = read_positive_int_env("FACE_MATCH_RESULT_MAX_ATTEMPTS", 2)
 REQUEST_RETRY_BASE_DELAY_SECONDS = read_optional_float_env("REQUEST_RETRY_BASE_DELAY_SECONDS") or 0.35
 REQUEST_RETRY_MAX_DELAY_SECONDS = read_optional_float_env("REQUEST_RETRY_MAX_DELAY_SECONDS") or 1.0
 PIPELINE_SUPERVISOR_ENABLED = read_bool_env("PIPELINE_SUPERVISOR_ENABLED", False)
@@ -896,6 +897,45 @@ def build_scan_result_payload(
         "model_version": str(deepfake_result.get("model_version", DEEPFAKE_MODEL_VERSION)),
         "flagged": flagged,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def build_face_match_payload(
+    consultation_id: int,
+    microcheck_id: int,
+    user_id: int,
+    verified_role: str,
+    recognition_result: dict[str, Any],
+) -> dict[str, Any]:
+    matched_raw = recognition_result.get("matched")
+    similarity_raw = recognition_result.get("best_similarity")
+    reference_loaded = bool(recognition_result.get("reference_loaded"))
+
+    has_explicit_decision = reference_loaded and matched_raw is not None and similarity_raw is not None
+    if has_explicit_decision:
+        matched = bool(matched_raw)
+        try:
+            face_match_score_value = float(similarity_raw)
+            face_match_score_value = max(0.0, min(1.0, face_match_score_value))
+            face_match_score = round(face_match_score_value, 4)
+        except (TypeError, ValueError):
+            matched = False
+            face_match_score = 0.0
+            has_explicit_decision = False
+    else:
+        matched = False
+        face_match_score = 0.0
+
+    flagged = (not matched) if has_explicit_decision else False
+
+    return {
+        "consultation_id": consultation_id,
+        "microcheck_id": microcheck_id,
+        "user_id": user_id,
+        "verified_role": verified_role,
+        "matched": matched,
+        "face_match_score": face_match_score,
+        "flagged": flagged,
     }
 
 
@@ -1892,6 +1932,42 @@ async def send_face_match_result(session: aiohttp.ClientSession, payload: dict[s
     await post_internal_json(session, build_internal_url("face-match-results"), payload)
 
 
+async def send_face_match_result_with_retry(
+    session: aiohttp.ClientSession,
+    payload: dict[str, Any],
+    max_attempts: int = FACE_MATCH_RESULT_MAX_ATTEMPTS,
+) -> bool:
+    safe_max_attempts = max(max_attempts, 1)
+
+    for attempt in range(1, safe_max_attempts + 1):
+        stored, retryable = await post_internal_json_with_retryability(
+            session,
+            build_internal_url("face-match-results"),
+            payload,
+        )
+
+        if stored:
+            return True
+
+        if not retryable or attempt >= safe_max_attempts:
+            return False
+
+        retry_delay_seconds = compute_retry_delay_seconds(attempt - 1)
+        logger.info(
+            "Retrying face match submission in %.2fs (attempt %s/%s) consultation_id=%s microcheck_id=%s role=%s user_id=%s",
+            retry_delay_seconds,
+            attempt + 1,
+            safe_max_attempts,
+            payload.get("consultation_id"),
+            payload.get("microcheck_id"),
+            payload.get("verified_role"),
+            payload.get("user_id"),
+        )
+        await asyncio.sleep(retry_delay_seconds)
+
+    return False
+
+
 async def send_scan_result(session: aiohttp.ClientSession, payload: dict[str, Any]) -> bool:
     return await post_internal_json(session, build_internal_url("scan-results"), payload)
 
@@ -2157,6 +2233,32 @@ async def video_track_handler(
                 if not isinstance(microcheck_id, int):
                     logger.warning("Claimed microcheck payload missing numeric id for consultation %s", gallery.consultation_id)
                     continue
+
+                role_inference_result = patient_results if claim_role == "patient" else doctor_results
+                face_match_payload = build_face_match_payload(
+                    consultation_id=gallery.consultation_id,
+                    microcheck_id=microcheck_id,
+                    user_id=claim_user_id,
+                    verified_role=claim_role,
+                    recognition_result=role_inference_result,
+                )
+                stored_face_match = await send_face_match_result_with_retry(
+                    http_session,
+                    face_match_payload,
+                )
+                if not stored_face_match:
+                    logger.warning(
+                        (
+                            "Face match submission failed after retries. "
+                            "consultation_id=%s microcheck_id=%s role=%s user_id=%s track=%s frame=%s"
+                        ),
+                        gallery.consultation_id,
+                        microcheck_id,
+                        claim_role,
+                        claim_user_id,
+                        track.sid,
+                        analyzed_frame_number,
+                    )
 
                 deepfake_scan_payload = build_scan_result_payload(
                     consultation_id=gallery.consultation_id,
