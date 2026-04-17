@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -154,12 +155,43 @@ MICROCHECK_CLAIM_MAX_ATTEMPTS = read_positive_int_env("MICROCHECK_CLAIM_MAX_ATTE
 SCAN_RESULT_MAX_ATTEMPTS = read_positive_int_env("SCAN_RESULT_MAX_ATTEMPTS", 2)
 REQUEST_RETRY_BASE_DELAY_SECONDS = read_optional_float_env("REQUEST_RETRY_BASE_DELAY_SECONDS") or 0.35
 REQUEST_RETRY_MAX_DELAY_SECONDS = read_optional_float_env("REQUEST_RETRY_MAX_DELAY_SECONDS") or 1.0
+PIPELINE_SUPERVISOR_ENABLED = read_bool_env("PIPELINE_SUPERVISOR_ENABLED", False)
+PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS") or 5.0
+PIPELINE_SUPERVISOR_ROOMS_PER_PAGE = read_positive_int_env("PIPELINE_SUPERVISOR_ROOMS_PER_PAGE", 50)
+PIPELINE_SUPERVISOR_MAX_PAGES = read_positive_int_env("PIPELINE_SUPERVISOR_MAX_PAGES", 5)
+PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS") or 15.0
+PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS") or 2.0
 
 if REQUEST_RETRY_BASE_DELAY_SECONDS <= 0:
     REQUEST_RETRY_BASE_DELAY_SECONDS = 0.35
 
 if REQUEST_RETRY_MAX_DELAY_SECONDS < REQUEST_RETRY_BASE_DELAY_SECONDS:
     REQUEST_RETRY_MAX_DELAY_SECONDS = REQUEST_RETRY_BASE_DELAY_SECONDS
+
+if PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS <= 0:
+    PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS = 5.0
+
+if PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS <= 0:
+    PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS = max(PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS * 2, 10.0)
+
+if PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS <= 0:
+    PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class ActiveConsultationRoom:
+    consultation_id: int
+    room_name: str
+    room_sid: str | None
+    ws_url: str
+    pipeline_token: str
+
+
+@dataclass
+class PolledRoomWorkerState:
+    room: ActiveConsultationRoom
+    task: asyncio.Task[Any]
+    last_seen_at_monotonic: float
 
 
 def build_pipeline_signature_headers(body: str = "") -> dict[str, str]:
@@ -184,6 +216,441 @@ def resolve_asset_url(url: str) -> str:
         return url
 
     return urljoin(f"{LARAVEL_BASE_URL}/", url.lstrip("/"))
+
+
+def parse_active_consultation_room(payload: Any) -> ActiveConsultationRoom | None:
+    if not isinstance(payload, dict):
+        return None
+
+    consultation_id_raw = payload.get("consultation_id")
+    room_name = str(payload.get("room_name", "")).strip()
+    ws_url = str(payload.get("ws_url", "")).strip()
+    pipeline_token = str(payload.get("pipeline_token", "")).strip()
+
+    try:
+        consultation_id = int(consultation_id_raw)
+    except (TypeError, ValueError):
+        return None
+
+    if consultation_id <= 0 or room_name == "" or ws_url == "" or pipeline_token == "":
+        return None
+
+    room_sid_raw = payload.get("room_sid")
+    room_sid: str | None
+    if room_sid_raw is None:
+        room_sid = None
+    else:
+        normalized_room_sid = str(room_sid_raw).strip()
+        room_sid = normalized_room_sid if normalized_room_sid != "" else None
+
+    return ActiveConsultationRoom(
+        consultation_id=consultation_id,
+        room_name=room_name,
+        room_sid=room_sid,
+        ws_url=ws_url,
+        pipeline_token=pipeline_token,
+    )
+
+
+def dedupe_active_consultation_rooms(rooms: list[ActiveConsultationRoom]) -> list[ActiveConsultationRoom]:
+    deduped_rooms_by_name: dict[str, ActiveConsultationRoom] = {}
+
+    for room in rooms:
+        if room.room_name in deduped_rooms_by_name:
+            continue
+
+        deduped_rooms_by_name[room.room_name] = room
+
+    return list(deduped_rooms_by_name.values())
+
+
+def extract_active_consultation_rooms(payload: Any) -> list[ActiveConsultationRoom]:
+    if not isinstance(payload, list):
+        return []
+
+    rooms: list[ActiveConsultationRoom] = []
+    for payload_item in payload:
+        parsed_room = parse_active_consultation_room(payload_item)
+        if parsed_room is None:
+            continue
+
+        rooms.append(parsed_room)
+
+    return dedupe_active_consultation_rooms(rooms)
+
+
+async def fetch_active_consultation_rooms_page(
+    session: aiohttp.ClientSession,
+    page: int,
+    per_page: int,
+) -> tuple[list[ActiveConsultationRoom], bool, bool]:
+    endpoint = build_internal_url(f"rooms?page={page}&per_page={per_page}")
+
+    try:
+        async with session.get(endpoint, headers=build_pipeline_signature_headers("")) as response:
+            if response.status != 200:
+                response_text = await response.text()
+                logger.warning(
+                    "Pipeline rooms endpoint returned HTTP %s page=%s body=%s",
+                    response.status,
+                    page,
+                    response_text[:500],
+                )
+                return [], False, True
+
+            payload = await response.json()
+    except Exception as error:
+        logger.error("Failed to poll pipeline rooms endpoint page=%s: %s", page, error)
+        return [], False, True
+
+    if not isinstance(payload, list):
+        logger.warning("Pipeline rooms endpoint returned invalid payload type page=%s type=%s", page, type(payload).__name__)
+        return [], False, True
+
+    parsed_rooms = extract_active_consultation_rooms(payload)
+    has_more_pages = len(payload) >= per_page
+    return parsed_rooms, has_more_pages, False
+
+
+async def poll_active_consultation_rooms(
+    session: aiohttp.ClientSession,
+    per_page: int = PIPELINE_SUPERVISOR_ROOMS_PER_PAGE,
+    max_pages: int = PIPELINE_SUPERVISOR_MAX_PAGES,
+) -> tuple[list[ActiveConsultationRoom], bool]:
+    safe_per_page = max(per_page, 1)
+    safe_max_pages = max(max_pages, 1)
+
+    collected_rooms: list[ActiveConsultationRoom] = []
+
+    for page in range(1, safe_max_pages + 1):
+        page_rooms, has_more_pages, had_retryable_failure = await fetch_active_consultation_rooms_page(
+            session,
+            page=page,
+            per_page=safe_per_page,
+        )
+
+        if had_retryable_failure:
+            return dedupe_active_consultation_rooms(collected_rooms), False
+
+        collected_rooms.extend(page_rooms)
+
+        if not has_more_pages:
+            break
+
+    return dedupe_active_consultation_rooms(collected_rooms), True
+
+
+def reconcile_polled_room_workers(
+    discovered_rooms: list[ActiveConsultationRoom],
+    worker_states: dict[str, PolledRoomWorkerState],
+    now_monotonic: float,
+    stale_room_seconds: float,
+) -> tuple[list[ActiveConsultationRoom], list[str]]:
+    discovered_by_room_name: dict[str, ActiveConsultationRoom] = {
+        room.room_name: room for room in discovered_rooms
+    }
+
+    rooms_to_start: list[ActiveConsultationRoom] = []
+    for room_name, discovered_room in discovered_by_room_name.items():
+        existing_state = worker_states.get(room_name)
+
+        if existing_state is None or existing_state.task.done():
+            rooms_to_start.append(discovered_room)
+            continue
+
+        existing_state.room = discovered_room
+        existing_state.last_seen_at_monotonic = now_monotonic
+
+    rooms_to_stop: list[str] = []
+    for room_name, worker_state in worker_states.items():
+        if room_name in discovered_by_room_name:
+            continue
+
+        if (now_monotonic - worker_state.last_seen_at_monotonic) >= stale_room_seconds:
+            rooms_to_stop.append(room_name)
+
+    return rooms_to_start, rooms_to_stop
+
+
+def prune_finished_polled_room_workers(worker_states: dict[str, PolledRoomWorkerState]) -> None:
+    for room_name, worker_state in list(worker_states.items()):
+        if worker_state.task.done():
+            worker_states.pop(room_name, None)
+
+
+async def cancel_polled_room_worker(
+    worker_state: PolledRoomWorkerState,
+    reason: str,
+) -> None:
+    if worker_state.task.done():
+        return
+
+    logger.info(
+        "Stopping polled room worker consultation_id=%s room=%s reason=%s",
+        worker_state.room.consultation_id,
+        worker_state.room.room_name,
+        reason,
+    )
+    worker_state.task.cancel()
+
+    try:
+        await worker_state.task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception(
+            "Polled room worker failed during shutdown consultation_id=%s room=%s",
+            worker_state.room.consultation_id,
+            worker_state.room.room_name,
+        )
+
+
+async def run_room_processing_loop(room: Any, room_name: str) -> None:
+    active_track_tasks: dict[str, asyncio.Task[Any]] = {}
+    track_owner_identity: dict[str, str] = {}
+
+    def schedule_video_track_handler(
+        track: rtc.Track,
+        participant: rtc.RemoteParticipant | None,
+        source: str,
+    ) -> bool:
+        if track.kind != rtc.TrackKind.KIND_VIDEO:
+            return False
+
+        track_sid = str(getattr(track, "sid", "")).strip()
+        if track_sid == "":
+            logger.warning("Skipping video track without SID source=%s room=%s", source, room_name)
+            return False
+
+        if has_active_track_handler(active_track_tasks, track_sid):
+            logger.info("Skipping duplicate video track handler for track=%s source=%s room=%s", track_sid, source, room_name)
+            return False
+
+        participant_identity = str(getattr(participant, "identity", "unknown"))
+        handler_task = asyncio.create_task(video_track_handler(track, participant, room_name=room_name))
+        active_track_tasks[track_sid] = handler_task
+        track_owner_identity[track_sid] = participant_identity
+        logger.info(
+            "Scheduled video track handler track=%s participant=%s source=%s room=%s",
+            track_sid,
+            participant_identity,
+            source,
+            room_name,
+        )
+
+        def on_handler_done(done_task: asyncio.Task[Any], sid: str = track_sid, owner: str = participant_identity) -> None:
+            tracked_task = active_track_tasks.get(sid)
+            if tracked_task is done_task:
+                active_track_tasks.pop(sid, None)
+                track_owner_identity.pop(sid, None)
+
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                logger.info("Video track handler cancelled track=%s participant=%s room=%s", sid, owner, room_name)
+            except Exception:
+                logger.exception("Video track handler failed track=%s participant=%s room=%s", sid, owner, room_name)
+
+        handler_task.add_done_callback(on_handler_done)
+        return True
+
+    @room.on("track_subscribed")
+    def on_track_subscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        schedule_video_track_handler(track, participant, source="event:track_subscribed")
+
+    @room.on("track_unsubscribed")
+    def on_track_unsubscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        track_sid = str(getattr(track, "sid", "") or getattr(publication, "sid", "")).strip()
+        if track_sid == "":
+            return
+
+        existing_task = active_track_tasks.get(track_sid)
+        if existing_task is None or existing_task.done():
+            return
+
+        logger.info(
+            "Cancelling video track handler because track unsubscribed track=%s participant=%s room=%s",
+            track_sid,
+            getattr(participant, "identity", "unknown"),
+            room_name,
+        )
+        existing_task.cancel()
+
+    @room.on("participant_disconnected")
+    def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
+        participant_identity = str(getattr(participant, "identity", "")).strip()
+        if participant_identity == "":
+            return
+
+        for track_sid, owner_identity in list(track_owner_identity.items()):
+            if owner_identity != participant_identity:
+                continue
+
+            existing_task = active_track_tasks.get(track_sid)
+            if existing_task is None or existing_task.done():
+                continue
+
+            logger.info(
+                "Cancelling video track handler due to participant disconnect track=%s participant=%s room=%s",
+                track_sid,
+                participant_identity,
+                room_name,
+            )
+            existing_task.cancel()
+
+    remote_participants = list_remote_participants(room)
+    scheduled_existing_tracks = 0
+    for remote_participant in remote_participants:
+        for existing_track in list_video_tracks_for_participant(remote_participant):
+            if schedule_video_track_handler(existing_track, remote_participant, source="bootstrap:existing-track"):
+                scheduled_existing_tracks += 1
+
+    logger.info(
+        "Existing-track bootstrap completed room=%s participants=%s scheduled_tracks=%s",
+        room_name,
+        len(remote_participants),
+        scheduled_existing_tracks,
+    )
+
+    try:
+        await asyncio.Future()
+    finally:
+        pending_track_tasks = [
+            active_track_task
+            for active_track_task in active_track_tasks.values()
+            if not active_track_task.done()
+        ]
+
+        for active_track_task in pending_track_tasks:
+            active_track_task.cancel()
+
+        if pending_track_tasks:
+            await asyncio.gather(*pending_track_tasks, return_exceptions=True)
+
+
+async def polled_room_worker(room: ActiveConsultationRoom) -> None:
+    rtc_room = rtc.Room()
+
+    try:
+        await rtc_room.connect(
+            room.ws_url,
+            room.pipeline_token,
+            options=rtc.RoomOptions(auto_subscribe=True),
+        )
+        logger.info(
+            "Connected polled room worker consultation_id=%s room=%s",
+            room.consultation_id,
+            room.room_name,
+        )
+        await run_room_processing_loop(rtc_room, room.room_name)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Polled room worker failed consultation_id=%s room=%s",
+            room.consultation_id,
+            room.room_name,
+        )
+    finally:
+        try:
+            if rtc_room.isconnected():
+                await rtc_room.disconnect()
+        except Exception:
+            logger.exception(
+                "Failed to disconnect polled room worker consultation_id=%s room=%s",
+                room.consultation_id,
+                room.room_name,
+            )
+
+
+async def run_pipeline_supervisor() -> None:
+    worker_states: dict[str, PolledRoomWorkerState] = {}
+    consecutive_poll_failures = 0
+
+    logger.info(
+        "Pipeline supervisor started poll_interval=%.2fs rooms_per_page=%s max_pages=%s stale_room_seconds=%.2f",
+        PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS,
+        PIPELINE_SUPERVISOR_ROOMS_PER_PAGE,
+        PIPELINE_SUPERVISOR_MAX_PAGES,
+        PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS,
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                prune_finished_polled_room_workers(worker_states)
+
+                discovered_rooms, poll_succeeded = await poll_active_consultation_rooms(
+                    session,
+                    per_page=PIPELINE_SUPERVISOR_ROOMS_PER_PAGE,
+                    max_pages=PIPELINE_SUPERVISOR_MAX_PAGES,
+                )
+
+                now_monotonic = time.monotonic()
+                if poll_succeeded:
+                    consecutive_poll_failures = 0
+
+                    rooms_to_start, rooms_to_stop = reconcile_polled_room_workers(
+                        discovered_rooms=discovered_rooms,
+                        worker_states=worker_states,
+                        now_monotonic=now_monotonic,
+                        stale_room_seconds=PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS,
+                    )
+
+                    discovered_room_names = ",".join(sorted(room.room_name for room in discovered_rooms))
+                    logger.info(
+                        "Pipeline supervisor poll ok active_rooms=%s active_workers=%s rooms=%s",
+                        len(discovered_rooms),
+                        len(worker_states),
+                        discovered_room_names if discovered_room_names != "" else "none",
+                    )
+
+                    for room_to_start in rooms_to_start:
+                        worker_task = asyncio.create_task(polled_room_worker(room_to_start))
+                        worker_states[room_to_start.room_name] = PolledRoomWorkerState(
+                            room=room_to_start,
+                            task=worker_task,
+                            last_seen_at_monotonic=now_monotonic,
+                        )
+                        logger.info(
+                            "Started polled room worker consultation_id=%s room=%s",
+                            room_to_start.consultation_id,
+                            room_to_start.room_name,
+                        )
+
+                    for room_name_to_stop in rooms_to_stop:
+                        existing_worker_state = worker_states.pop(room_name_to_stop, None)
+                        if existing_worker_state is None:
+                            continue
+
+                        await cancel_polled_room_worker(existing_worker_state, reason="room_not_returned_by_poll")
+
+                    await asyncio.sleep(PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS)
+                    continue
+
+                consecutive_poll_failures += 1
+                backoff_seconds = max(
+                    PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS,
+                    compute_retry_delay_seconds(consecutive_poll_failures - 1),
+                )
+                logger.warning(
+                    "Pipeline supervisor poll failed. retrying_in=%.2fs consecutive_failures=%s",
+                    backoff_seconds,
+                    consecutive_poll_failures,
+                )
+                await asyncio.sleep(backoff_seconds)
+    finally:
+        for room_name, worker_state in list(worker_states.items()):
+            await cancel_polled_room_worker(worker_state, reason="supervisor_shutdown")
+            worker_states.pop(room_name, None)
 
 
 def resolve_deepfake_backend(requested_backend: str, fallback_backend: str, strict_mode: bool) -> tuple[str, bool]:
@@ -1466,7 +1933,7 @@ async def send_scan_result_with_retry(
 async def video_track_handler(
     track: rtc.Track,
     participant: rtc.RemoteParticipant | None,
-    ctx: JobContext,
+    room_name: str,
 ) -> None:
     import cv2
 
@@ -1481,8 +1948,8 @@ async def video_track_handler(
 
     async with aiohttp.ClientSession() as http_session:
         gallery = FaceGallery()
-        await gallery.load_for_room(ctx.room.name, http_session, active_pipeline)
-        await refresh_consultation_context_once(gallery, ctx.room.name, http_session, active_pipeline)
+        await gallery.load_for_room(room_name, http_session, active_pipeline)
+        await refresh_consultation_context_once(gallery, room_name, http_session, active_pipeline)
 
         participant_identity = str(getattr(participant, "identity", "unknown"))
         inferred_role, inferred_user_id = gallery.resolve_track_subject(participant)
@@ -1723,129 +2190,20 @@ def prewarm(process: JobProcess) -> None:
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    active_track_tasks: dict[str, asyncio.Task[Any]] = {}
-    track_owner_identity: dict[str, str] = {}
-
-    def schedule_video_track_handler(
-        track: rtc.Track,
-        participant: rtc.RemoteParticipant | None,
-        source: str,
-    ) -> bool:
-        if track.kind != rtc.TrackKind.KIND_VIDEO:
-            return False
-
-        track_sid = str(getattr(track, "sid", "")).strip()
-        if track_sid == "":
-            logger.warning("Skipping video track without SID source=%s", source)
-            return False
-
-        if has_active_track_handler(active_track_tasks, track_sid):
-            logger.info("Skipping duplicate video track handler for track=%s source=%s", track_sid, source)
-            return False
-
-        participant_identity = str(getattr(participant, "identity", "unknown"))
-        handler_task = asyncio.create_task(video_track_handler(track, participant, ctx))
-        active_track_tasks[track_sid] = handler_task
-        track_owner_identity[track_sid] = participant_identity
-        logger.info(
-            "Scheduled video track handler track=%s participant=%s source=%s",
-            track_sid,
-            participant_identity,
-            source,
-        )
-
-        def on_handler_done(done_task: asyncio.Task[Any], sid: str = track_sid, owner: str = participant_identity) -> None:
-            tracked_task = active_track_tasks.get(sid)
-            if tracked_task is done_task:
-                active_track_tasks.pop(sid, None)
-                track_owner_identity.pop(sid, None)
-
-            try:
-                done_task.result()
-            except asyncio.CancelledError:
-                logger.info("Video track handler cancelled track=%s participant=%s", sid, owner)
-            except Exception:
-                logger.exception("Video track handler failed track=%s participant=%s", sid, owner)
-
-        handler_task.add_done_callback(on_handler_done)
-        return True
-
-    @ctx.room.on("track_subscribed")
-    def on_track_subscribed(
-        track: rtc.Track,
-        publication: rtc.RemoteTrackPublication,
-        participant: rtc.RemoteParticipant,
-    ) -> None:
-        schedule_video_track_handler(track, participant, source="event:track_subscribed")
-
-    @ctx.room.on("track_unsubscribed")
-    def on_track_unsubscribed(
-        track: rtc.Track,
-        publication: rtc.RemoteTrackPublication,
-        participant: rtc.RemoteParticipant,
-    ) -> None:
-        track_sid = str(getattr(track, "sid", "") or getattr(publication, "sid", "")).strip()
-        if track_sid == "":
-            return
-
-        existing_task = active_track_tasks.get(track_sid)
-        if existing_task is None or existing_task.done():
-            return
-
-        logger.info(
-            "Cancelling video track handler because track unsubscribed track=%s participant=%s",
-            track_sid,
-            getattr(participant, "identity", "unknown"),
-        )
-        existing_task.cancel()
-
-    @ctx.room.on("participant_disconnected")
-    def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
-        participant_identity = str(getattr(participant, "identity", "")).strip()
-        if participant_identity == "":
-            return
-
-        for track_sid, owner_identity in list(track_owner_identity.items()):
-            if owner_identity != participant_identity:
-                continue
-
-            existing_task = active_track_tasks.get(track_sid)
-            if existing_task is None or existing_task.done():
-                continue
-
-            logger.info(
-                "Cancelling video track handler due to participant disconnect track=%s participant=%s",
-                track_sid,
-                participant_identity,
-            )
-            existing_task.cancel()
-
     await ctx.connect(auto_subscribe=AutoSubscribe.VIDEO_ONLY)
     logger.info("Connected to room: %s", ctx.room.name)
-
-    remote_participants = list_remote_participants(ctx.room)
-    scheduled_existing_tracks = 0
-    for remote_participant in remote_participants:
-        for existing_track in list_video_tracks_for_participant(remote_participant):
-            if schedule_video_track_handler(existing_track, remote_participant, source="bootstrap:existing-track"):
-                scheduled_existing_tracks += 1
-
-    logger.info(
-        "Existing-track bootstrap completed room=%s participants=%s scheduled_tracks=%s",
-        ctx.room.name,
-        len(remote_participants),
-        scheduled_existing_tracks,
-    )
-
-    await asyncio.Future()
+    await run_room_processing_loop(ctx.room, ctx.room.name)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm,
-            initialize_process_timeout=60.0,
+    if PIPELINE_SUPERVISOR_ENABLED:
+        asyncio.run(run_pipeline_supervisor())
+    else:
+        cli.run_app(
+            WorkerOptions(
+                entrypoint_fnc=entrypoint,
+                prewarm_fnc=prewarm,
+                initialize_process_timeout=60.0,
+            )
         )
-    )

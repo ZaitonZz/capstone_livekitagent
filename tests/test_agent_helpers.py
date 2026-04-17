@@ -1,5 +1,6 @@
 import unittest
 import os
+from unittest.mock import Mock
 
 from tests._agent_import_stubs import install_agent_dependency_stubs
 
@@ -7,13 +8,19 @@ install_agent_dependency_stubs()
 
 import agent
 from agent import (
+    ActiveConsultationRoom,
+    PolledRoomWorkerState,
     build_deepfake_overlay_lines,
     build_saved_frame_filename,
     build_scan_result_payload,
     compute_retry_delay_seconds,
+    dedupe_active_consultation_rooms,
     determine_deepfake_result,
     determine_deepfake_result_with_threshold,
+    extract_active_consultation_rooms,
+    parse_active_consultation_room,
     read_positive_int_env,
+    reconcile_polled_room_workers,
     resolve_deepfake_backend,
     resolve_fake_class_index_for_backend,
     resolve_claim_subject_for_scan,
@@ -329,6 +336,199 @@ class AgentHelperFunctionsTest(unittest.TestCase):
 
         self.assertIsNone(role)
         self.assertIsNone(user_id)
+
+    def test_parse_active_consultation_room_accepts_valid_payload(self) -> None:
+        parsed = parse_active_consultation_room(
+            {
+                "consultation_id": "12",
+                "room_name": "consultation-12-abcdef",
+                "room_sid": "RM_123",
+                "ws_url": "wss://example.livekit.cloud",
+                "pipeline_token": "token-123",
+            }
+        )
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.consultation_id, 12)
+        self.assertEqual(parsed.room_name, "consultation-12-abcdef")
+        self.assertEqual(parsed.room_sid, "RM_123")
+        self.assertEqual(parsed.ws_url, "wss://example.livekit.cloud")
+        self.assertEqual(parsed.pipeline_token, "token-123")
+
+    def test_parse_active_consultation_room_rejects_missing_required_fields(self) -> None:
+        parsed = parse_active_consultation_room(
+            {
+                "consultation_id": 12,
+                "room_name": "",
+                "ws_url": "wss://example.livekit.cloud",
+                "pipeline_token": "token-123",
+            }
+        )
+
+        self.assertIsNone(parsed)
+
+    def test_extract_active_consultation_rooms_filters_invalid_payload_items(self) -> None:
+        rooms = extract_active_consultation_rooms(
+            [
+                {
+                    "consultation_id": 12,
+                    "room_name": "consultation-12-abcdef",
+                    "room_sid": "RM_123",
+                    "ws_url": "wss://example.livekit.cloud",
+                    "pipeline_token": "token-123",
+                },
+                {
+                    "consultation_id": "invalid",
+                    "room_name": "consultation-99-invalid",
+                    "ws_url": "wss://example.livekit.cloud",
+                    "pipeline_token": "token-456",
+                },
+            ]
+        )
+
+        self.assertEqual(len(rooms), 1)
+        self.assertEqual(rooms[0].consultation_id, 12)
+
+    def test_dedupe_active_consultation_rooms_by_room_name(self) -> None:
+        room_a = ActiveConsultationRoom(
+            consultation_id=12,
+            room_name="consultation-12-abcdef",
+            room_sid="RM_123",
+            ws_url="wss://example.livekit.cloud",
+            pipeline_token="token-123",
+        )
+        room_b = ActiveConsultationRoom(
+            consultation_id=99,
+            room_name="consultation-12-abcdef",
+            room_sid="RM_999",
+            ws_url="wss://example.livekit.cloud",
+            pipeline_token="token-999",
+        )
+
+        deduped_rooms = dedupe_active_consultation_rooms([room_a, room_b])
+
+        self.assertEqual(len(deduped_rooms), 1)
+        self.assertEqual(deduped_rooms[0].consultation_id, 12)
+
+    def test_reconcile_polled_room_workers_starts_missing_worker(self) -> None:
+        discovered_room = ActiveConsultationRoom(
+            consultation_id=12,
+            room_name="consultation-12-abcdef",
+            room_sid="RM_123",
+            ws_url="wss://example.livekit.cloud",
+            pipeline_token="token-123",
+        )
+
+        rooms_to_start, rooms_to_stop = reconcile_polled_room_workers(
+            discovered_rooms=[discovered_room],
+            worker_states={},
+            now_monotonic=10.0,
+            stale_room_seconds=15.0,
+        )
+
+        self.assertEqual([room.room_name for room in rooms_to_start], ["consultation-12-abcdef"])
+        self.assertEqual(rooms_to_stop, [])
+
+    def test_reconcile_polled_room_workers_updates_existing_worker(self) -> None:
+        running_task = Mock()
+        running_task.done.return_value = False
+
+        existing_room = ActiveConsultationRoom(
+            consultation_id=12,
+            room_name="consultation-12-abcdef",
+            room_sid="RM_123",
+            ws_url="wss://old.example.livekit.cloud",
+            pipeline_token="old-token",
+        )
+        updated_room = ActiveConsultationRoom(
+            consultation_id=12,
+            room_name="consultation-12-abcdef",
+            room_sid="RM_123",
+            ws_url="wss://new.example.livekit.cloud",
+            pipeline_token="new-token",
+        )
+
+        worker_states = {
+            "consultation-12-abcdef": PolledRoomWorkerState(
+                room=existing_room,
+                task=running_task,
+                last_seen_at_monotonic=1.0,
+            )
+        }
+
+        rooms_to_start, rooms_to_stop = reconcile_polled_room_workers(
+            discovered_rooms=[updated_room],
+            worker_states=worker_states,
+            now_monotonic=20.0,
+            stale_room_seconds=15.0,
+        )
+
+        self.assertEqual(rooms_to_start, [])
+        self.assertEqual(rooms_to_stop, [])
+        self.assertEqual(worker_states["consultation-12-abcdef"].last_seen_at_monotonic, 20.0)
+        self.assertEqual(
+            worker_states["consultation-12-abcdef"].room.ws_url,
+            "wss://new.example.livekit.cloud",
+        )
+
+    def test_reconcile_polled_room_workers_stops_stale_workers(self) -> None:
+        running_task = Mock()
+        running_task.done.return_value = False
+
+        stale_room = ActiveConsultationRoom(
+            consultation_id=12,
+            room_name="consultation-12-abcdef",
+            room_sid="RM_123",
+            ws_url="wss://example.livekit.cloud",
+            pipeline_token="token-123",
+        )
+        worker_states = {
+            "consultation-12-abcdef": PolledRoomWorkerState(
+                room=stale_room,
+                task=running_task,
+                last_seen_at_monotonic=2.0,
+            )
+        }
+
+        rooms_to_start, rooms_to_stop = reconcile_polled_room_workers(
+            discovered_rooms=[],
+            worker_states=worker_states,
+            now_monotonic=20.0,
+            stale_room_seconds=10.0,
+        )
+
+        self.assertEqual(rooms_to_start, [])
+        self.assertEqual(rooms_to_stop, ["consultation-12-abcdef"])
+
+    def test_reconcile_polled_room_workers_keeps_recent_missing_worker(self) -> None:
+        running_task = Mock()
+        running_task.done.return_value = False
+
+        stale_room = ActiveConsultationRoom(
+            consultation_id=12,
+            room_name="consultation-12-abcdef",
+            room_sid="RM_123",
+            ws_url="wss://example.livekit.cloud",
+            pipeline_token="token-123",
+        )
+        worker_states = {
+            "consultation-12-abcdef": PolledRoomWorkerState(
+                room=stale_room,
+                task=running_task,
+                last_seen_at_monotonic=16.0,
+            )
+        }
+
+        rooms_to_start, rooms_to_stop = reconcile_polled_room_workers(
+            discovered_rooms=[],
+            worker_states=worker_states,
+            now_monotonic=20.0,
+            stale_room_seconds=10.0,
+        )
+
+        self.assertEqual(rooms_to_start, [])
+        self.assertEqual(rooms_to_stop, [])
 
 
 if __name__ == "__main__":
