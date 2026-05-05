@@ -34,6 +34,7 @@ load_dotenv()
 
 logger = logging.getLogger("video-pipeline-agent")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AGENT_LOG_LEVEL = os.getenv("AGENT_LOG_LEVEL", "INFO").strip()
 
 
 def read_positive_int_env(name: str, default: int) -> int:
@@ -83,6 +84,46 @@ def read_bool_env(name: str, default: bool) -> bool:
         return False
 
     return default
+
+
+def resolve_log_level(level_name: str, default: int = logging.INFO) -> int:
+    normalized_level_name = level_name.strip()
+    if normalized_level_name == "":
+        return default
+
+    if normalized_level_name.isdigit():
+        return int(normalized_level_name)
+
+    resolved_level = getattr(logging, normalized_level_name.upper(), None)
+    if isinstance(resolved_level, int):
+        return resolved_level
+
+    return default
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=resolve_log_level(AGENT_LOG_LEVEL),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+
+
+def describe_active_consultation_rooms(rooms: list[Any]) -> str:
+    room_descriptions: list[str] = []
+    for room in rooms:
+        room_name = str(getattr(room, "room_name", "")).strip()
+        if room_name == "":
+            continue
+
+        consultation_id = getattr(room, "consultation_id", None)
+        if consultation_id is None:
+            room_descriptions.append(room_name)
+            continue
+
+        room_descriptions.append(f"{room_name}#{consultation_id}")
+
+    return ", ".join(room_descriptions) if room_descriptions else "none"
 
 
 LARAVEL_BASE_URL = os.getenv("LARAVEL_BASE_URL", "http://localhost:8000").rstrip("/")
@@ -156,7 +197,7 @@ SCAN_RESULT_MAX_ATTEMPTS = read_positive_int_env("SCAN_RESULT_MAX_ATTEMPTS", 2)
 FACE_MATCH_RESULT_MAX_ATTEMPTS = read_positive_int_env("FACE_MATCH_RESULT_MAX_ATTEMPTS", 2)
 REQUEST_RETRY_BASE_DELAY_SECONDS = read_optional_float_env("REQUEST_RETRY_BASE_DELAY_SECONDS") or 0.35
 REQUEST_RETRY_MAX_DELAY_SECONDS = read_optional_float_env("REQUEST_RETRY_MAX_DELAY_SECONDS") or 1.0
-PIPELINE_SUPERVISOR_ENABLED = read_bool_env("PIPELINE_SUPERVISOR_ENABLED", False)
+PIPELINE_SUPERVISOR_ENABLED = read_bool_env("PIPELINE_SUPERVISOR_ENABLED", True)
 PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS") or 5.0
 PIPELINE_SUPERVISOR_ROOMS_PER_PAGE = read_positive_int_env("PIPELINE_SUPERVISOR_ROOMS_PER_PAGE", 50)
 PIPELINE_SUPERVISOR_MAX_PAGES = read_positive_int_env("PIPELINE_SUPERVISOR_MAX_PAGES", 5)
@@ -286,6 +327,7 @@ async def fetch_active_consultation_rooms_page(
     per_page: int,
 ) -> tuple[list[ActiveConsultationRoom], bool, bool]:
     endpoint = build_internal_url(f"rooms?page={page}&per_page={per_page}")
+    logger.info("Polling active rooms page=%s per_page=%s endpoint=%s", page, per_page, endpoint)
 
     try:
         async with session.get(endpoint, headers=build_pipeline_signature_headers("")) as response:
@@ -310,6 +352,12 @@ async def fetch_active_consultation_rooms_page(
 
     parsed_rooms = extract_active_consultation_rooms(payload)
     has_more_pages = len(payload) >= per_page
+    logger.info(
+        "Fetched active rooms page=%s parsed_rooms=%s has_more_pages=%s",
+        page,
+        len(parsed_rooms),
+        has_more_pages,
+    )
     return parsed_rooms, has_more_pages, False
 
 
@@ -587,6 +635,11 @@ async def run_pipeline_supervisor() -> None:
     try:
         async with aiohttp.ClientSession() as session:
             while True:
+                logger.info(
+                    "Supervisor checking active sessions existing_workers=%s poll_interval=%.2fs",
+                    len(worker_states),
+                    PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS,
+                )
                 prune_finished_polled_room_workers(worker_states)
 
                 discovered_rooms, poll_succeeded = await poll_active_consultation_rooms(
@@ -606,12 +659,19 @@ async def run_pipeline_supervisor() -> None:
                         stale_room_seconds=PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS,
                     )
 
-                    discovered_room_names = ",".join(sorted(room.room_name for room in discovered_rooms))
+                    discovered_room_names = describe_active_consultation_rooms(discovered_rooms)
+                    rooms_to_start_names = describe_active_consultation_rooms(rooms_to_start)
+                    rooms_to_stop_names = ", ".join(sorted(rooms_to_stop)) if rooms_to_stop else "none"
                     logger.info(
                         "Pipeline supervisor poll ok active_rooms=%s active_workers=%s rooms=%s",
                         len(discovered_rooms),
                         len(worker_states),
-                        discovered_room_names if discovered_room_names != "" else "none",
+                        discovered_room_names,
+                    )
+                    logger.info(
+                        "Pipeline supervisor reconcile start=%s stop=%s",
+                        rooms_to_start_names,
+                        rooms_to_stop_names,
                     )
 
                     for room_to_start in rooms_to_start:
@@ -2287,21 +2347,24 @@ async def video_track_handler(
 
 
 def prewarm(process: JobProcess) -> None:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     logger.info("Prewarm complete. Models will be loaded lazily on first track.")
 
 
 async def entrypoint(ctx: JobContext) -> None:
+    configure_logging()
     await ctx.connect(auto_subscribe=AutoSubscribe.VIDEO_ONLY)
     logger.info("Connected to room: %s", ctx.room.name)
     await run_room_processing_loop(ctx.room, ctx.room.name)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     if PIPELINE_SUPERVISOR_ENABLED:
+        logger.info("Starting in pipeline supervisor mode")
         asyncio.run(run_pipeline_supervisor())
     else:
+        logger.info("Starting in LiveKit worker mode")
         cli.run_app(
             WorkerOptions(
                 entrypoint_fnc=entrypoint,

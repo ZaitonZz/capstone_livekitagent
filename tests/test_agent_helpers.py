@@ -1,6 +1,8 @@
-import unittest
+import asyncio
+import logging
 import os
-from unittest.mock import Mock
+import unittest
+from unittest.mock import AsyncMock, Mock, patch
 
 from tests._agent_import_stubs import install_agent_dependency_stubs
 
@@ -15,12 +17,15 @@ from agent import (
     build_saved_frame_filename,
     build_scan_result_payload,
     compute_retry_delay_seconds,
+    describe_active_consultation_rooms,
     dedupe_active_consultation_rooms,
     determine_deepfake_result,
     determine_deepfake_result_with_threshold,
     extract_active_consultation_rooms,
     parse_active_consultation_room,
+    poll_active_consultation_rooms,
     read_positive_int_env,
+    resolve_log_level,
     reconcile_polled_room_workers,
     resolve_deepfake_backend,
     resolve_fake_class_index_for_backend,
@@ -51,6 +56,26 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         )
 
         self.assertEqual(filename, "consultation-unknown_track-TR-with-separators_frame-000003_999.jpg")
+
+    def test_describe_active_consultation_rooms_uses_stable_summary(self) -> None:
+        room = ActiveConsultationRoom(
+            consultation_id=42,
+            room_name="consultation-42-abcdef",
+            room_sid="RM_123",
+            ws_url="wss://example.livekit.cloud",
+            pipeline_token="token-123",
+        )
+
+        self.assertEqual(
+            describe_active_consultation_rooms([room]),
+            "consultation-42-abcdef#42",
+        )
+        self.assertEqual(describe_active_consultation_rooms([]), "none")
+
+    def test_resolve_log_level_accepts_names_and_numbers(self) -> None:
+        self.assertEqual(resolve_log_level("warning"), logging.WARNING)
+        self.assertEqual(resolve_log_level("15"), 15)
+        self.assertEqual(resolve_log_level("not-a-level", default=logging.ERROR), logging.ERROR)
 
     def test_determine_deepfake_result_classifies_fake(self) -> None:
         result, confidence = determine_deepfake_result(0.9)
@@ -585,6 +610,17 @@ class AgentHelperFunctionsTest(unittest.TestCase):
 
         self.assertEqual(rooms_to_start, [])
         self.assertEqual(rooms_to_stop, [])
+
+    def test_poll_active_consultation_rooms_returns_failure_on_retryable_error(self) -> None:
+        async def run_poll() -> tuple[list[ActiveConsultationRoom], bool]:
+            with patch("agent.fetch_active_consultation_rooms_page", new_callable=AsyncMock) as fetch_page:
+                fetch_page.return_value = ([], False, True)
+                return await poll_active_consultation_rooms(Mock(), per_page=1, max_pages=2)
+
+        rooms, succeeded = asyncio.run(run_poll())
+
+        self.assertEqual(rooms, [])
+        self.assertEqual(succeeded, False)
 
 
 if __name__ == "__main__":
