@@ -327,7 +327,7 @@ async def fetch_active_consultation_rooms_page(
     per_page: int,
 ) -> tuple[list[ActiveConsultationRoom], bool, bool]:
     endpoint = build_internal_url(f"rooms?page={page}&per_page={per_page}")
-    logger.info("Polling active rooms page=%s per_page=%s endpoint=%s", page, per_page, endpoint)
+    logger.debug("Polling active rooms page=%s per_page=%s endpoint=%s", page, per_page, endpoint)
 
     try:
         async with session.get(endpoint, headers=build_pipeline_signature_headers("")) as response:
@@ -352,12 +352,7 @@ async def fetch_active_consultation_rooms_page(
 
     parsed_rooms = extract_active_consultation_rooms(payload)
     has_more_pages = len(payload) >= per_page
-    logger.info(
-        "Fetched active rooms page=%s parsed_rooms=%s has_more_pages=%s",
-        page,
-        len(parsed_rooms),
-        has_more_pages,
-    )
+    logger.debug("Fetched active rooms page=%s parsed_rooms=%s has_more_pages=%s", page, len(parsed_rooms), has_more_pages)
     return parsed_rooms, has_more_pages, False
 
 
@@ -635,11 +630,6 @@ async def run_pipeline_supervisor() -> None:
     try:
         async with aiohttp.ClientSession() as session:
             while True:
-                logger.info(
-                    "Supervisor checking active sessions existing_workers=%s poll_interval=%.2fs",
-                    len(worker_states),
-                    PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS,
-                )
                 prune_finished_polled_room_workers(worker_states)
 
                 discovered_rooms, poll_succeeded = await poll_active_consultation_rooms(
@@ -663,13 +653,10 @@ async def run_pipeline_supervisor() -> None:
                     rooms_to_start_names = describe_active_consultation_rooms(rooms_to_start)
                     rooms_to_stop_names = ", ".join(sorted(rooms_to_stop)) if rooms_to_stop else "none"
                     logger.info(
-                        "Pipeline supervisor poll ok active_rooms=%s active_workers=%s rooms=%s",
+                        "Poll OK: rooms=%s workers=%s active=%s start=%s stop=%s",
                         len(discovered_rooms),
                         len(worker_states),
                         discovered_room_names,
-                    )
-                    logger.info(
-                        "Pipeline supervisor reconcile start=%s stop=%s",
                         rooms_to_start_names,
                         rooms_to_stop_names,
                     )
@@ -681,11 +668,7 @@ async def run_pipeline_supervisor() -> None:
                             task=worker_task,
                             last_seen_at_monotonic=now_monotonic,
                         )
-                        logger.info(
-                            "Started polled room worker consultation_id=%s room=%s",
-                            room_to_start.consultation_id,
-                            room_to_start.room_name,
-                        )
+                        logger.info("Join room: consultation_id=%s room=%s", room_to_start.consultation_id, room_to_start.room_name)
 
                     for room_name_to_stop in rooms_to_stop:
                         existing_worker_state = worker_states.pop(room_name_to_stop, None)
@@ -702,11 +685,7 @@ async def run_pipeline_supervisor() -> None:
                     PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS,
                     compute_retry_delay_seconds(consecutive_poll_failures - 1),
                 )
-                logger.warning(
-                    "Pipeline supervisor poll failed. retrying_in=%.2fs consecutive_failures=%s",
-                    backoff_seconds,
-                    consecutive_poll_failures,
-                )
+                logger.warning("Poll failed: retrying in %.2fs (failures=%s)", backoff_seconds, consecutive_poll_failures)
                 await asyncio.sleep(backoff_seconds)
     finally:
         for room_name, worker_state in list(worker_states.items()):
