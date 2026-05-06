@@ -79,7 +79,7 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         self.assertEqual(resolve_log_level("not-a-level", default=logging.ERROR), logging.ERROR)
 
     def test_resolve_livekit_api_url_from_websocket_url(self) -> None:
-        with patch.object(agent, "LIVEKIT_API_URL", ""):
+        with patch.object(agent, "LIVEKIT_API_URL", ""), patch.object(agent, "LIVEKIT_URL", ""):
             self.assertEqual(
                 resolve_livekit_api_url("wss://example.livekit.cloud"),
                 "https://example.livekit.cloud",
@@ -87,6 +87,20 @@ class AgentHelperFunctionsTest(unittest.TestCase):
             self.assertEqual(
                 resolve_livekit_api_url("ws://localhost:7880"),
                 "http://localhost:7880",
+            )
+
+    def test_resolve_livekit_api_url_prefers_livekit_url_env(self) -> None:
+        with patch.object(agent, "LIVEKIT_API_URL", ""), patch.object(agent, "LIVEKIT_URL", "wss://env.livekit.cloud"):
+            self.assertEqual(
+                resolve_livekit_api_url("wss://wrong.example.test"),
+                "https://env.livekit.cloud",
+            )
+
+    def test_resolve_livekit_api_url_prefers_explicit_api_url_env(self) -> None:
+        with patch.object(agent, "LIVEKIT_API_URL", "https://api.livekit.test"), patch.object(agent, "LIVEKIT_URL", "wss://env.livekit.cloud"):
+            self.assertEqual(
+                resolve_livekit_api_url("wss://wrong.example.test"),
+                "https://api.livekit.test",
             )
 
     def test_issue_livekit_room_list_token_requires_credentials(self) -> None:

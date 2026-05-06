@@ -165,6 +165,7 @@ def format_poll_status(
 LARAVEL_BASE_URL = os.getenv("LARAVEL_BASE_URL", "http://localhost:8000").rstrip("/")
 LARAVEL_ENDPOINT = os.getenv("LARAVEL_ENDPOINT", f"{LARAVEL_BASE_URL}/api/frame-results")
 LIVEKIT_API_URL = os.getenv("LIVEKIT_API_URL", "").strip().rstrip("/")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip().rstrip("/")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
 PIPELINE_INTERNAL_BASE_URL = os.getenv(
@@ -341,13 +342,14 @@ def resolve_livekit_api_url(ws_url: str) -> str:
     if LIVEKIT_API_URL != "":
         return LIVEKIT_API_URL
 
-    parsed_url = urlparse(ws_url)
+    livekit_url = LIVEKIT_URL if LIVEKIT_URL != "" else ws_url
+    parsed_url = urlparse(livekit_url)
     if parsed_url.scheme == "wss":
         return urlunparse(("https", parsed_url.netloc, "", "", "", "")).rstrip("/")
     if parsed_url.scheme == "ws":
         return urlunparse(("http", parsed_url.netloc, "", "", "", "")).rstrip("/")
 
-    return ws_url.rstrip("/")
+    return livekit_url.rstrip("/")
 
 
 def parse_active_consultation_room(payload: Any) -> ActiveConsultationRoom | None:
