@@ -25,6 +25,7 @@ from agent import (
     parse_active_consultation_room,
     poll_active_consultation_rooms,
     read_positive_int_env,
+    resolve_livekit_api_url,
     resolve_log_level,
     reconcile_polled_room_workers,
     resolve_deepfake_backend,
@@ -76,6 +77,22 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         self.assertEqual(resolve_log_level("warning"), logging.WARNING)
         self.assertEqual(resolve_log_level("15"), 15)
         self.assertEqual(resolve_log_level("not-a-level", default=logging.ERROR), logging.ERROR)
+
+    def test_resolve_livekit_api_url_from_websocket_url(self) -> None:
+        with patch.object(agent, "LIVEKIT_API_URL", ""):
+            self.assertEqual(
+                resolve_livekit_api_url("wss://example.livekit.cloud"),
+                "https://example.livekit.cloud",
+            )
+            self.assertEqual(
+                resolve_livekit_api_url("ws://localhost:7880"),
+                "http://localhost:7880",
+            )
+
+    def test_issue_livekit_room_list_token_requires_credentials(self) -> None:
+        with patch.object(agent, "LIVEKIT_API_KEY", ""), patch.object(agent, "LIVEKIT_API_SECRET", ""):
+            with self.assertRaises(RuntimeError):
+                agent.issue_livekit_room_list_token(now_timestamp=1000)
 
     def test_determine_deepfake_result_classifies_fake(self) -> None:
         result, confidence = determine_deepfake_result(0.9)
@@ -667,6 +684,37 @@ class AgentHelperFunctionsTest(unittest.TestCase):
 
         self.assertEqual(rooms_to_start, [])
         self.assertEqual(rooms_to_stop, ["consultation-3"])
+
+    def test_filter_rooms_with_livekit_participants_keeps_occupied_rooms(self) -> None:
+        rooms = [
+            ActiveConsultationRoom(
+                consultation_id=1,
+                room_name="consultation-1",
+                room_sid="RM_1",
+                ws_url="wss://example.livekit.cloud",
+                pipeline_token="token-1",
+            ),
+            ActiveConsultationRoom(
+                consultation_id=2,
+                room_name="consultation-2",
+                room_sid="RM_2",
+                ws_url="wss://example.livekit.cloud",
+                pipeline_token="token-2",
+            ),
+        ]
+
+        async def run_filter() -> list[ActiveConsultationRoom]:
+            with patch.object(agent, "PIPELINE_SUPERVISOR_REQUIRE_PARTICIPANTS", True):
+                with patch("agent.fetch_livekit_room_participant_counts", new_callable=AsyncMock) as fetch_counts:
+                    fetch_counts.return_value = {
+                        "consultation-1": 1,
+                        "consultation-2": 0,
+                    }
+                    return await agent.filter_rooms_with_livekit_participants(Mock(), rooms)
+
+        filtered_rooms = asyncio.run(run_filter())
+
+        self.assertEqual([room.room_name for room in filtered_rooms], ["consultation-1"])
 
     def test_poll_active_consultation_rooms_returns_failure_on_retryable_error(self) -> None:
         async def run_poll() -> tuple[list[ActiveConsultationRoom], bool]:

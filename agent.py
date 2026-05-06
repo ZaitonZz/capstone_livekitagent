@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ import os
 import threading
 import time
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 
 # Apply torch runtime log controls before any module imports torch.
 os.environ.setdefault("PYTORCH_DISABLE_NNPACK", "1")
@@ -163,6 +164,9 @@ def format_poll_status(
 
 LARAVEL_BASE_URL = os.getenv("LARAVEL_BASE_URL", "http://localhost:8000").rstrip("/")
 LARAVEL_ENDPOINT = os.getenv("LARAVEL_ENDPOINT", f"{LARAVEL_BASE_URL}/api/frame-results")
+LIVEKIT_API_URL = os.getenv("LIVEKIT_API_URL", "").strip().rstrip("/")
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
 PIPELINE_INTERNAL_BASE_URL = os.getenv(
     "PIPELINE_INTERNAL_BASE_URL",
     f"{LARAVEL_BASE_URL}/internal/pipeline",
@@ -237,6 +241,7 @@ PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS = read_optional_float_env("PIPELINE_SU
 PIPELINE_SUPERVISOR_ROOMS_PER_PAGE = read_positive_int_env("PIPELINE_SUPERVISOR_ROOMS_PER_PAGE", 50)
 PIPELINE_SUPERVISOR_MAX_PAGES = read_positive_int_env("PIPELINE_SUPERVISOR_MAX_PAGES", 5)
 PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS = read_positive_int_env("PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS", 10)
+PIPELINE_SUPERVISOR_REQUIRE_PARTICIPANTS = read_bool_env("PIPELINE_SUPERVISOR_REQUIRE_PARTICIPANTS", True)
 PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS") or 15.0
 PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS") or 2.0
 
@@ -294,6 +299,55 @@ def resolve_asset_url(url: str) -> str:
         return url
 
     return urljoin(f"{LARAVEL_BASE_URL}/", url.lstrip("/"))
+
+
+def base64_url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def issue_livekit_room_list_token(now_timestamp: int | None = None) -> str:
+    if LIVEKIT_API_KEY == "" or LIVEKIT_API_SECRET == "":
+        raise RuntimeError("Missing LIVEKIT_API_KEY or LIVEKIT_API_SECRET for LiveKit room listing.")
+
+    issued_at = int(time.time() if now_timestamp is None else now_timestamp)
+    header = {
+        "alg": "HS256",
+        "typ": "JWT",
+    }
+    payload = {
+        "iss": LIVEKIT_API_KEY,
+        "sub": "pipeline-room-lister",
+        "nbf": issued_at,
+        "iat": issued_at,
+        "exp": issued_at + 300,
+        "video": {
+            "roomList": True,
+        },
+    }
+
+    encoded_header = base64_url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    encoded_payload = base64_url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{encoded_header}.{encoded_payload}"
+    signature = hmac.new(
+        LIVEKIT_API_SECRET.encode("utf-8"),
+        signing_input.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+    return f"{signing_input}.{base64_url_encode(signature)}"
+
+
+def resolve_livekit_api_url(ws_url: str) -> str:
+    if LIVEKIT_API_URL != "":
+        return LIVEKIT_API_URL
+
+    parsed_url = urlparse(ws_url)
+    if parsed_url.scheme == "wss":
+        return urlunparse(("https", parsed_url.netloc, "", "", "", "")).rstrip("/")
+    if parsed_url.scheme == "ws":
+        return urlunparse(("http", parsed_url.netloc, "", "", "", "")).rstrip("/")
+
+    return ws_url.rstrip("/")
 
 
 def parse_active_consultation_room(payload: Any) -> ActiveConsultationRoom | None:
@@ -418,6 +472,98 @@ async def poll_active_consultation_rooms(
             break
 
     return dedupe_active_consultation_rooms(collected_rooms), True
+
+
+async def fetch_livekit_room_participant_counts(
+    session: aiohttp.ClientSession,
+    rooms: list[ActiveConsultationRoom],
+) -> dict[str, int]:
+    rooms_by_api_url: dict[str, list[ActiveConsultationRoom]] = {}
+    for room in rooms:
+        api_url = resolve_livekit_api_url(room.ws_url)
+        if api_url == "":
+            continue
+
+        rooms_by_api_url.setdefault(api_url, []).append(room)
+
+    if not rooms_by_api_url:
+        return {}
+
+    room_list_token = issue_livekit_room_list_token()
+    participant_counts: dict[str, int] = {}
+
+    for api_url, api_rooms in rooms_by_api_url.items():
+        room_names = list(dict.fromkeys(room.room_name for room in api_rooms if room.room_name.strip() != ""))
+        for room_name_chunk_start in range(0, len(room_names), 100):
+            room_name_chunk = room_names[room_name_chunk_start : room_name_chunk_start + 100]
+            if not room_name_chunk:
+                continue
+
+            endpoint = f"{api_url.rstrip('/')}/twirp/livekit.RoomService/ListRooms"
+            try:
+                async with session.post(
+                    endpoint,
+                    json={"names": room_name_chunk},
+                    headers={"Authorization": f"Bearer {room_list_token}"},
+                ) as response:
+                    if response.status != 200:
+                        response_text = await response.text()
+                        logger.warning(
+                            "LiveKit room listing failed HTTP %s endpoint=%s body=%s",
+                            response.status,
+                            endpoint,
+                            response_text[:500],
+                        )
+                        continue
+
+                    payload = await response.json()
+            except Exception as error:
+                logger.error("Failed to list LiveKit rooms endpoint=%s: %s", endpoint, error)
+                continue
+
+            for listed_room in payload.get("rooms", []) if isinstance(payload, dict) else []:
+                if not isinstance(listed_room, dict):
+                    continue
+
+                room_name = str(listed_room.get("name", "")).strip()
+                if room_name == "":
+                    continue
+
+                try:
+                    participant_counts[room_name] = int(listed_room.get("num_participants", 0))
+                except (TypeError, ValueError):
+                    participant_counts[room_name] = 0
+
+    return participant_counts
+
+
+async def filter_rooms_with_livekit_participants(
+    session: aiohttp.ClientSession,
+    rooms: list[ActiveConsultationRoom],
+) -> list[ActiveConsultationRoom]:
+    if not PIPELINE_SUPERVISOR_REQUIRE_PARTICIPANTS or not rooms:
+        return rooms
+
+    try:
+        participant_counts = await fetch_livekit_room_participant_counts(session, rooms)
+    except Exception as error:
+        logger.error("LiveKit participant preflight failed; skipping worker starts this poll: %s", error)
+        return []
+
+    filtered_rooms = [
+        room
+        for room in rooms
+        if participant_counts.get(room.room_name, 0) > 0
+    ]
+    skipped_room_count = len(rooms) - len(filtered_rooms)
+
+    if skipped_room_count > 0:
+        logger.info(
+            "Skipping %s active consultation rooms without visible LiveKit participants",
+            skipped_room_count,
+        )
+
+    return filtered_rooms
 
 
 def reconcile_polled_room_workers(
@@ -708,6 +854,8 @@ async def run_pipeline_supervisor() -> None:
                     per_page=PIPELINE_SUPERVISOR_ROOMS_PER_PAGE,
                     max_pages=PIPELINE_SUPERVISOR_MAX_PAGES,
                 )
+                discovered_rooms_before_participant_filter = len(discovered_rooms)
+                discovered_rooms = await filter_rooms_with_livekit_participants(session, discovered_rooms)
 
                 now_monotonic = time.monotonic()
                 if poll_succeeded:
@@ -724,6 +872,12 @@ async def run_pipeline_supervisor() -> None:
                     discovered_room_names = describe_active_consultation_rooms(discovered_rooms)
                     rooms_to_start_names = describe_active_consultation_rooms(rooms_to_start)
                     rooms_to_stop_names = ", ".join(sorted(rooms_to_stop)) if rooms_to_stop else "none"
+                    if discovered_rooms_before_participant_filter != len(discovered_rooms):
+                        logger.info(
+                            "Participant preflight: %s discovered, %s with visible participants",
+                            discovered_rooms_before_participant_filter,
+                            len(discovered_rooms),
+                        )
                     if len(discovered_rooms) > PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS:
                         logger.warning(
                             "Active room poll returned %s rooms, limiting this process to %s workers",
