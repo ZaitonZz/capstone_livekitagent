@@ -712,6 +712,37 @@ async def run_room_processing_loop(room: Any, room_name: str, consultation_id: i
     if consultation_id is not None:
         status_heartbeat_task = asyncio.create_task(status_heartbeat_loop())
 
+    def publish_no_face_guidance(participant: rtc.RemoteParticipant | None, source: str) -> None:
+        if consultation_id is None:
+            return
+
+        guidance = build_no_face_guidance_for_participant(participant)
+        logger.info(
+            "Publishing no-face guidance because video stopped source=%s participant=%s room=%s",
+            source,
+            guidance.get("participant_identity"),
+            room_name,
+        )
+        asyncio.create_task(
+            send_pipeline_status(
+                http_session,
+                consultation_id,
+                room_name,
+                "running",
+                guidance=guidance,
+                room=room,
+            )
+        )
+
+    def publication_is_camera(publication: Any) -> bool:
+        publication_source = getattr(publication, "source", None)
+        camera_source = getattr(getattr(rtc, "TrackSource", object), "SOURCE_CAMERA", object())
+
+        if publication_source == camera_source:
+            return True
+
+        return "camera" in str(publication_source).lower()
+
     def schedule_video_track_handler(
         track: rtc.Track,
         participant: rtc.RemoteParticipant | None,
@@ -785,7 +816,28 @@ async def run_room_processing_loop(room: Any, room_name: str, consultation_id: i
             getattr(participant, "identity", "unknown"),
             room_name,
         )
+        publish_no_face_guidance(participant, "track_unsubscribed")
         existing_task.cancel()
+
+    @room.on("track_muted")
+    def on_track_muted(
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        if not publication_is_camera(publication):
+            return
+
+        publish_no_face_guidance(participant, "track_muted")
+
+    @room.on("track_unpublished")
+    def on_track_unpublished(
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        if not publication_is_camera(publication):
+            return
+
+        publish_no_face_guidance(participant, "track_unpublished")
 
     @room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
@@ -1135,6 +1187,28 @@ def list_video_tracks_for_participant(participant: Any) -> list[Any]:
         video_tracks.append(track)
 
     return video_tracks
+
+
+def build_no_face_guidance_for_participant(participant: Any | None, role: str | None = None) -> dict[str, Any]:
+    participant_identity = str(getattr(participant, "identity", "unknown")).strip() or "unknown"
+    resolved_role = role if role in {"patient", "doctor"} else None
+
+    if resolved_role is None and participant is not None:
+        metadata_raw = getattr(participant, "metadata", None)
+        if isinstance(metadata_raw, str) and metadata_raw.strip() != "":
+            try:
+                metadata = json.loads(metadata_raw)
+                metadata_role = str(metadata.get("role", "")).strip().lower()
+                if metadata_role in {"patient", "doctor"}:
+                    resolved_role = metadata_role
+            except json.JSONDecodeError:
+                logger.debug("Unable to decode participant metadata JSON for no-face guidance participant=%s", participant_identity)
+
+    return {
+        "no_face_detected": True,
+        "participant_identity": participant_identity,
+        "role": resolved_role if resolved_role in {"patient", "doctor"} else "unknown",
+    }
 
 
 def resolve_claim_subject_for_scan(

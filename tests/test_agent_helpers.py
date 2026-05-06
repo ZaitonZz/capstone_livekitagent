@@ -15,6 +15,7 @@ from agent import (
     build_face_match_payload,
     build_deepfake_overlay_lines,
     build_detection_data_channel_payload,
+    build_no_face_guidance_for_participant,
     build_pipeline_status_payload,
     build_saved_frame_filename,
     classify_camera_guidance,
@@ -285,6 +286,28 @@ class AgentHelperFunctionsTest(unittest.TestCase):
 
         self.assertEqual(guidance["no_face_detected"], False)
         self.assertEqual(guidance["role"], "doctor")
+
+    def test_build_no_face_guidance_for_participant_uses_metadata_role(self) -> None:
+        participant = Mock()
+        participant.identity = "user-9"
+        participant.metadata = '{"role":"patient"}'
+
+        guidance = build_no_face_guidance_for_participant(participant)
+
+        self.assertEqual(guidance["no_face_detected"], True)
+        self.assertEqual(guidance["participant_identity"], "user-9")
+        self.assertEqual(guidance["role"], "patient")
+
+    def test_build_no_face_guidance_for_participant_defaults_unknown_role(self) -> None:
+        participant = Mock()
+        participant.identity = "user-10"
+        participant.metadata = ""
+
+        guidance = build_no_face_guidance_for_participant(participant)
+
+        self.assertEqual(guidance["no_face_detected"], True)
+        self.assertEqual(guidance["participant_identity"], "user-10")
+        self.assertEqual(guidance["role"], "unknown")
 
     def test_should_report_deepfake_for_role_when_mode_is_patient(self) -> None:
         original = agent.DEEPFAKE_REPORTING_ROLE
