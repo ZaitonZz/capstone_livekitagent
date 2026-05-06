@@ -611,6 +611,63 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         self.assertEqual(rooms_to_start, [])
         self.assertEqual(rooms_to_stop, [])
 
+    def test_reconcile_polled_room_workers_limits_new_workers(self) -> None:
+        discovered_rooms = [
+            ActiveConsultationRoom(
+                consultation_id=index,
+                room_name=f"consultation-{index}",
+                room_sid=f"RM_{index}",
+                ws_url="wss://example.livekit.cloud",
+                pipeline_token=f"token-{index}",
+            )
+            for index in range(1, 5)
+        ]
+
+        rooms_to_start, rooms_to_stop = reconcile_polled_room_workers(
+            discovered_rooms=discovered_rooms,
+            worker_states={},
+            now_monotonic=20.0,
+            stale_room_seconds=10.0,
+            max_active_workers=2,
+        )
+
+        self.assertEqual([room.room_name for room in rooms_to_start], ["consultation-1", "consultation-2"])
+        self.assertEqual(rooms_to_stop, [])
+
+    def test_reconcile_polled_room_workers_stops_workers_over_limit(self) -> None:
+        running_task = Mock()
+        running_task.done.return_value = False
+
+        discovered_rooms = [
+            ActiveConsultationRoom(
+                consultation_id=index,
+                room_name=f"consultation-{index}",
+                room_sid=f"RM_{index}",
+                ws_url="wss://example.livekit.cloud",
+                pipeline_token=f"token-{index}",
+            )
+            for index in range(1, 4)
+        ]
+        worker_states = {
+            room.room_name: PolledRoomWorkerState(
+                room=room,
+                task=running_task,
+                last_seen_at_monotonic=20.0,
+            )
+            for room in discovered_rooms
+        }
+
+        rooms_to_start, rooms_to_stop = reconcile_polled_room_workers(
+            discovered_rooms=discovered_rooms,
+            worker_states=worker_states,
+            now_monotonic=25.0,
+            stale_room_seconds=10.0,
+            max_active_workers=2,
+        )
+
+        self.assertEqual(rooms_to_start, [])
+        self.assertEqual(rooms_to_stop, ["consultation-3"])
+
     def test_poll_active_consultation_rooms_returns_failure_on_retryable_error(self) -> None:
         async def run_poll() -> tuple[list[ActiveConsultationRoom], bool]:
             with patch("agent.fetch_active_consultation_rooms_page", new_callable=AsyncMock) as fetch_page:

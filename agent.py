@@ -236,6 +236,7 @@ PIPELINE_SUPERVISOR_ENABLED = read_bool_env("PIPELINE_SUPERVISOR_ENABLED", True)
 PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS") or 5.0
 PIPELINE_SUPERVISOR_ROOMS_PER_PAGE = read_positive_int_env("PIPELINE_SUPERVISOR_ROOMS_PER_PAGE", 50)
 PIPELINE_SUPERVISOR_MAX_PAGES = read_positive_int_env("PIPELINE_SUPERVISOR_MAX_PAGES", 5)
+PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS = read_positive_int_env("PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS", 10)
 PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS") or 15.0
 PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS") or 2.0
 
@@ -424,13 +425,43 @@ def reconcile_polled_room_workers(
     worker_states: dict[str, PolledRoomWorkerState],
     now_monotonic: float,
     stale_room_seconds: float,
+    max_active_workers: int | None = None,
 ) -> tuple[list[ActiveConsultationRoom], list[str]]:
-    discovered_by_room_name: dict[str, ActiveConsultationRoom] = {
+    all_discovered_by_room_name: dict[str, ActiveConsultationRoom] = {
         room.room_name: room for room in discovered_rooms
     }
 
+    selected_rooms = discovered_rooms
+    if max_active_workers is not None:
+        safe_max_active_workers = max(max_active_workers, 1)
+        selected_rooms_by_name: dict[str, ActiveConsultationRoom] = {}
+
+        for room in discovered_rooms:
+            existing_state = worker_states.get(room.room_name)
+            if existing_state is None or existing_state.task.done():
+                continue
+
+            selected_rooms_by_name[room.room_name] = room
+            if len(selected_rooms_by_name) >= safe_max_active_workers:
+                break
+
+        for room in discovered_rooms:
+            if len(selected_rooms_by_name) >= safe_max_active_workers:
+                break
+
+            if room.room_name in selected_rooms_by_name:
+                continue
+
+            selected_rooms_by_name[room.room_name] = room
+
+        selected_rooms = list(selected_rooms_by_name.values())
+
+    selected_by_room_name: dict[str, ActiveConsultationRoom] = {
+        room.room_name: room for room in selected_rooms
+    }
+
     rooms_to_start: list[ActiveConsultationRoom] = []
-    for room_name, discovered_room in discovered_by_room_name.items():
+    for room_name, discovered_room in selected_by_room_name.items():
         existing_state = worker_states.get(room_name)
 
         if existing_state is None or existing_state.task.done():
@@ -442,7 +473,11 @@ def reconcile_polled_room_workers(
 
     rooms_to_stop: list[str] = []
     for room_name, worker_state in worker_states.items():
-        if room_name in discovered_by_room_name:
+        if room_name in selected_by_room_name:
+            continue
+
+        if room_name in all_discovered_by_room_name:
+            rooms_to_stop.append(room_name)
             continue
 
         if (now_monotonic - worker_state.last_seen_at_monotonic) >= stale_room_seconds:
@@ -655,10 +690,11 @@ async def run_pipeline_supervisor() -> None:
     consecutive_poll_failures = 0
 
     logger.info(
-        "Pipeline supervisor started poll_interval=%.2fs rooms_per_page=%s max_pages=%s stale_room_seconds=%.2f",
+        "Pipeline supervisor started poll_interval=%.2fs rooms_per_page=%s max_pages=%s max_active_rooms=%s stale_room_seconds=%.2f",
         PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS,
         PIPELINE_SUPERVISOR_ROOMS_PER_PAGE,
         PIPELINE_SUPERVISOR_MAX_PAGES,
+        PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS,
         PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS,
     )
 
@@ -682,11 +718,18 @@ async def run_pipeline_supervisor() -> None:
                         worker_states=worker_states,
                         now_monotonic=now_monotonic,
                         stale_room_seconds=PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS,
+                        max_active_workers=PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS,
                     )
 
                     discovered_room_names = describe_active_consultation_rooms(discovered_rooms)
                     rooms_to_start_names = describe_active_consultation_rooms(rooms_to_start)
                     rooms_to_stop_names = ", ".join(sorted(rooms_to_stop)) if rooms_to_stop else "none"
+                    if len(discovered_rooms) > PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS:
+                        logger.warning(
+                            "Active room poll returned %s rooms, limiting this process to %s workers",
+                            len(discovered_rooms),
+                            PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS,
+                        )
                     logger.info(
                         "%s workers=%s",
                         format_poll_status(discovered_rooms, rooms_to_start, rooms_to_stop),
