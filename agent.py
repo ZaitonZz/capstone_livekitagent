@@ -259,8 +259,6 @@ PIPELINE_SUPERVISOR_REQUIRE_PARTICIPANTS = read_bool_env("PIPELINE_SUPERVISOR_RE
 PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS") or 15.0
 PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS") or 2.0
 PIPELINE_STATUS_HEARTBEAT_INTERVAL_SECONDS = read_optional_float_env("PIPELINE_STATUS_HEARTBEAT_INTERVAL_SECONDS") or 10.0
-CAMERA_LOW_LIGHT_LUMA_THRESHOLD = read_optional_float_env("PIPELINE_LOW_LIGHT_LUMA_THRESHOLD") or 0.22
-CAMERA_MIN_FACE_AREA_RATIO = read_optional_float_env("PIPELINE_MIN_FACE_AREA_RATIO") or 0.035
 
 if REQUEST_RETRY_BASE_DELAY_SECONDS <= 0:
     REQUEST_RETRY_BASE_DELAY_SECONDS = 0.35
@@ -1263,32 +1261,18 @@ def classify_camera_guidance(
     participant_identity: str | None = None,
     role: str | None = None,
 ) -> dict[str, Any]:
-    height, width = rgb_data_array.shape[:2]
-    frame_area = max(float(width * height), 1.0)
-    largest_face_area_ratio = 0.0
+    valid_face_count = 0
 
     for box in face_boxes or []:
         if len(box) < 4:
             continue
 
         x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-        face_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        largest_face_area_ratio = max(largest_face_area_ratio, face_area / frame_area)
-
-    rgb_float = rgb_data_array.astype(np.float32) / 255.0
-    luminance = (
-        (0.2126 * rgb_float[:, :, 0])
-        + (0.7152 * rgb_float[:, :, 1])
-        + (0.0722 * rgb_float[:, :, 2])
-    )
-    brightness = round(float(np.mean(luminance)), 4)
-    face_area_ratio = round(largest_face_area_ratio, 4)
+        if max(0.0, x2 - x1) > 0 and max(0.0, y2 - y1) > 0:
+            valid_face_count += 1
 
     return {
-        "low_light": brightness < CAMERA_LOW_LIGHT_LUMA_THRESHOLD,
-        "too_far": largest_face_area_ratio > 0 and largest_face_area_ratio < CAMERA_MIN_FACE_AREA_RATIO,
-        "face_area_ratio": face_area_ratio,
-        "brightness": brightness,
+        "no_face_detected": valid_face_count == 0,
         "participant_identity": participant_identity,
         "role": role if role in {"patient", "doctor"} else "unknown",
     }
@@ -1324,6 +1308,7 @@ def build_pipeline_status_payload(
 def build_detection_data_channel_payload(
     status_payload: dict[str, Any],
     timeout_seconds: int = 60,
+    no_face_timeout_seconds: int = 30,
 ) -> dict[str, Any]:
     status = str(status_payload.get("status", "running"))
     state = "running" if status == "running" else "starting" if status == "started" else "delayed"
@@ -1333,15 +1318,14 @@ def build_detection_data_channel_payload(
         "state": state,
         "status": status,
         "timeout_seconds": timeout_seconds,
+        "no_face_timeout_seconds": no_face_timeout_seconds,
         "last_heartbeat_at": status_payload.get("heartbeat_at") or datetime.now(timezone.utc).isoformat(),
         "last_heartbeat_age_seconds": 0,
         "started_at": None,
         "last_scan_at": status_payload.get("last_scan_at"),
         "guidance": {
-            "low_light": bool(guidance.get("low_light", False)),
-            "too_far": bool(guidance.get("too_far", False)),
-            "face_area_ratio": guidance.get("face_area_ratio"),
-            "brightness": guidance.get("brightness"),
+            "no_face_detected": bool(guidance.get("no_face_detected", False)),
+            "no_face_detected_since": guidance.get("no_face_detected_since"),
         },
     }
 

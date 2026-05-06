@@ -240,7 +240,7 @@ class AgentHelperFunctionsTest(unittest.TestCase):
             consultation_id=9,
             room_name="consultation-9-runtime",
             status="running",
-            guidance={"low_light": False, "too_far": True},
+            guidance={"no_face_detected": True},
             last_scan_at="2026-05-06T01:02:03+00:00",
         )
 
@@ -248,7 +248,7 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         self.assertEqual(payload["consultation_id"], 9)
         self.assertEqual(payload["room_name"], "consultation-9-runtime")
         self.assertIn("heartbeat_at", payload)
-        self.assertEqual(payload["guidance"]["too_far"], True)
+        self.assertEqual(payload["guidance"]["no_face_detected"], True)
         self.assertEqual(payload["last_scan_at"], "2026-05-06T01:02:03+00:00")
 
     def test_build_detection_data_channel_payload_maps_running_state(self) -> None:
@@ -256,10 +256,7 @@ class AgentHelperFunctionsTest(unittest.TestCase):
             {
                 "status": "running",
                 "guidance": {
-                    "low_light": True,
-                    "too_far": False,
-                    "face_area_ratio": 0.1,
-                    "brightness": 0.12,
+                    "no_face_detected": True,
                     "participant_identity": "user-3",
                     "role": "patient",
                 },
@@ -267,27 +264,27 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         )
 
         self.assertEqual(payload["state"], "running")
-        self.assertEqual(payload["guidance"]["low_light"], True)
+        self.assertEqual(payload["no_face_timeout_seconds"], 30)
+        self.assertEqual(payload["guidance"]["no_face_detected"], True)
+        self.assertIsNone(payload["guidance"]["no_face_detected_since"])
         self.assertNotIn("participant_identity", payload["guidance"])
         self.assertNotIn("role", payload["guidance"])
         self.assertNotIn("last_error", payload)
         self.assertEqual(payload["last_heartbeat_age_seconds"], 0)
 
-    def test_classify_camera_guidance_flags_low_light(self) -> None:
+    def test_classify_camera_guidance_flags_no_face_detected(self) -> None:
         frame = agent.np.zeros((80, 80, 3), dtype=agent.np.uint8)
-        guidance = classify_camera_guidance(frame, [[10, 10, 60, 60, 0.99]], "user-3", "patient")
+        guidance = classify_camera_guidance(frame, [], "user-3", "patient")
 
-        self.assertEqual(guidance["low_light"], True)
-        self.assertEqual(guidance["too_far"], False)
+        self.assertEqual(guidance["no_face_detected"], True)
         self.assertEqual(guidance["role"], "patient")
 
-    def test_classify_camera_guidance_flags_too_far_face(self) -> None:
+    def test_classify_camera_guidance_clears_no_face_when_face_box_exists(self) -> None:
         frame = agent.np.full((100, 100, 3), 240, dtype=agent.np.uint8)
         guidance = classify_camera_guidance(frame, [[10, 10, 20, 20, 0.99]], "user-4", "doctor")
 
-        self.assertEqual(guidance["low_light"], False)
-        self.assertEqual(guidance["too_far"], True)
-        self.assertLess(guidance["face_area_ratio"], agent.CAMERA_MIN_FACE_AREA_RATIO)
+        self.assertEqual(guidance["no_face_detected"], False)
+        self.assertEqual(guidance["role"], "doctor")
 
     def test_should_report_deepfake_for_role_when_mode_is_patient(self) -> None:
         original = agent.DEEPFAKE_REPORTING_ROLE
