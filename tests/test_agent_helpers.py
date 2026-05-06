@@ -14,7 +14,10 @@ from agent import (
     PolledRoomWorkerState,
     build_face_match_payload,
     build_deepfake_overlay_lines,
+    build_detection_data_channel_payload,
+    build_pipeline_status_payload,
     build_saved_frame_filename,
+    classify_camera_guidance,
     build_scan_result_payload,
     compute_retry_delay_seconds,
     describe_active_consultation_rooms,
@@ -23,6 +26,7 @@ from agent import (
     determine_deepfake_result_with_threshold,
     extract_active_consultation_rooms,
     parse_active_consultation_room,
+    parse_consultation_id_from_room_name,
     poll_active_consultation_rooms,
     read_positive_int_env,
     resolve_livekit_api_url,
@@ -72,6 +76,10 @@ class AgentHelperFunctionsTest(unittest.TestCase):
             "consultation-42-abcdef#42",
         )
         self.assertEqual(describe_active_consultation_rooms([]), "none")
+
+    def test_parse_consultation_id_from_room_name(self) -> None:
+        self.assertEqual(parse_consultation_id_from_room_name("consultation-42-abcdef"), 42)
+        self.assertIsNone(parse_consultation_id_from_room_name("not-a-consultation"))
 
     def test_resolve_log_level_accepts_names_and_numbers(self) -> None:
         self.assertEqual(resolve_log_level("warning"), logging.WARNING)
@@ -226,6 +234,57 @@ class AgentHelperFunctionsTest(unittest.TestCase):
         self.assertEqual(payload["matched"], False)
         self.assertEqual(payload["face_match_score"], 0.0)
         self.assertEqual(payload["flagged"], False)
+
+    def test_build_pipeline_status_payload_includes_runtime_fields(self) -> None:
+        payload = build_pipeline_status_payload(
+            consultation_id=9,
+            room_name="consultation-9-runtime",
+            status="running",
+            guidance={"low_light": False, "too_far": True},
+            last_scan_at="2026-05-06T01:02:03+00:00",
+        )
+
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["consultation_id"], 9)
+        self.assertEqual(payload["room_name"], "consultation-9-runtime")
+        self.assertIn("heartbeat_at", payload)
+        self.assertEqual(payload["guidance"]["too_far"], True)
+        self.assertEqual(payload["last_scan_at"], "2026-05-06T01:02:03+00:00")
+
+    def test_build_detection_data_channel_payload_maps_running_state(self) -> None:
+        payload = build_detection_data_channel_payload(
+            {
+                "status": "running",
+                "guidance": {
+                    "low_light": True,
+                    "too_far": False,
+                    "face_area_ratio": 0.1,
+                    "brightness": 0.12,
+                    "participant_identity": "user-3",
+                    "role": "patient",
+                },
+            }
+        )
+
+        self.assertEqual(payload["state"], "running")
+        self.assertEqual(payload["guidance"]["low_light"], True)
+        self.assertEqual(payload["last_heartbeat_age_seconds"], 0)
+
+    def test_classify_camera_guidance_flags_low_light(self) -> None:
+        frame = agent.np.zeros((80, 80, 3), dtype=agent.np.uint8)
+        guidance = classify_camera_guidance(frame, [[10, 10, 60, 60, 0.99]], "user-3", "patient")
+
+        self.assertEqual(guidance["low_light"], True)
+        self.assertEqual(guidance["too_far"], False)
+        self.assertEqual(guidance["role"], "patient")
+
+    def test_classify_camera_guidance_flags_too_far_face(self) -> None:
+        frame = agent.np.full((100, 100, 3), 240, dtype=agent.np.uint8)
+        guidance = classify_camera_guidance(frame, [[10, 10, 20, 20, 0.99]], "user-4", "doctor")
+
+        self.assertEqual(guidance["low_light"], False)
+        self.assertEqual(guidance["too_far"], True)
+        self.assertLess(guidance["face_area_ratio"], agent.CAMERA_MIN_FACE_AREA_RATIO)
 
     def test_should_report_deepfake_for_role_when_mode_is_patient(self) -> None:
         original = agent.DEEPFAKE_REPORTING_ROLE

@@ -129,6 +129,19 @@ def describe_active_consultation_rooms(rooms: list[Any]) -> str:
     return ", ".join(room_descriptions) if room_descriptions else "none"
 
 
+def parse_consultation_id_from_room_name(room_name: str) -> int | None:
+    parts = room_name.strip().split("-")
+    if len(parts) < 2 or parts[0] != "consultation":
+        return None
+
+    try:
+        consultation_id = int(parts[1])
+    except ValueError:
+        return None
+
+    return consultation_id if consultation_id > 0 else None
+
+
 def summarize_named_items(items: list[Any], limit: int = 3) -> str:
     names: list[str] = []
     for item in items:
@@ -245,6 +258,9 @@ PIPELINE_SUPERVISOR_MAX_ACTIVE_ROOMS = read_positive_int_env("PIPELINE_SUPERVISO
 PIPELINE_SUPERVISOR_REQUIRE_PARTICIPANTS = read_bool_env("PIPELINE_SUPERVISOR_REQUIRE_PARTICIPANTS", True)
 PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS") or 15.0
 PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS = read_optional_float_env("PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS") or 2.0
+PIPELINE_STATUS_HEARTBEAT_INTERVAL_SECONDS = read_optional_float_env("PIPELINE_STATUS_HEARTBEAT_INTERVAL_SECONDS") or 10.0
+CAMERA_LOW_LIGHT_LUMA_THRESHOLD = read_optional_float_env("PIPELINE_LOW_LIGHT_LUMA_THRESHOLD") or 0.22
+CAMERA_MIN_FACE_AREA_RATIO = read_optional_float_env("PIPELINE_MIN_FACE_AREA_RATIO") or 0.035
 
 if REQUEST_RETRY_BASE_DELAY_SECONDS <= 0:
     REQUEST_RETRY_BASE_DELAY_SECONDS = 0.35
@@ -257,6 +273,9 @@ if PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS <= 0:
 
 if PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS <= 0:
     PIPELINE_SUPERVISOR_STALE_ROOM_SECONDS = max(PIPELINE_SUPERVISOR_POLL_INTERVAL_SECONDS * 2, 10.0)
+
+if PIPELINE_STATUS_HEARTBEAT_INTERVAL_SECONDS <= 0:
+    PIPELINE_STATUS_HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 if PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS <= 0:
     PIPELINE_SUPERVISOR_FAILURE_BACKOFF_SECONDS = 2.0
@@ -667,9 +686,33 @@ async def cancel_polled_room_worker(
         )
 
 
-async def run_room_processing_loop(room: Any, room_name: str) -> None:
+async def run_room_processing_loop(room: Any, room_name: str, consultation_id: int | None = None) -> None:
     active_track_tasks: dict[str, asyncio.Task[Any]] = {}
     track_owner_identity: dict[str, str] = {}
+    http_session = await get_or_create_shared_http_session()
+    status_heartbeat_task: asyncio.Task[Any] | None = None
+
+    async def status_heartbeat_loop() -> None:
+        await send_pipeline_status(
+            http_session,
+            consultation_id,
+            room_name,
+            "started",
+            room=room,
+        )
+
+        while True:
+            await asyncio.sleep(PIPELINE_STATUS_HEARTBEAT_INTERVAL_SECONDS)
+            await send_pipeline_status(
+                http_session,
+                consultation_id,
+                room_name,
+                "running",
+                room=room,
+            )
+
+    if consultation_id is not None:
+        status_heartbeat_task = asyncio.create_task(status_heartbeat_loop())
 
     def schedule_video_track_handler(
         track: rtc.Track,
@@ -689,7 +732,7 @@ async def run_room_processing_loop(room: Any, room_name: str) -> None:
             return False
 
         participant_identity = str(getattr(participant, "identity", "unknown"))
-        handler_task = asyncio.create_task(video_track_handler(track, participant, room_name=room_name))
+        handler_task = asyncio.create_task(video_track_handler(track, participant, room_name=room_name, room=room))
         active_track_tasks[track_sid] = handler_task
         track_owner_identity[track_sid] = participant_identity
         logger.info(
@@ -797,6 +840,10 @@ async def run_room_processing_loop(room: Any, room_name: str) -> None:
         if pending_track_tasks:
             await asyncio.gather(*pending_track_tasks, return_exceptions=True)
 
+        if status_heartbeat_task is not None:
+            status_heartbeat_task.cancel()
+            await asyncio.gather(status_heartbeat_task, return_exceptions=True)
+
 
 async def polled_room_worker(room: ActiveConsultationRoom) -> None:
     rtc_room = rtc.Room()
@@ -812,7 +859,7 @@ async def polled_room_worker(room: ActiveConsultationRoom) -> None:
             room.consultation_id,
             room.room_name,
         )
-        await run_room_processing_loop(rtc_room, room.room_name)
+        await run_room_processing_loop(rtc_room, room.room_name, consultation_id=room.consultation_id)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -1207,6 +1254,97 @@ def build_face_match_payload(
         "matched": matched,
         "face_match_score": face_match_score,
         "flagged": flagged,
+    }
+
+
+def classify_camera_guidance(
+    rgb_data_array: np.ndarray,
+    face_boxes: list[list[float]] | None,
+    participant_identity: str | None = None,
+    role: str | None = None,
+) -> dict[str, Any]:
+    height, width = rgb_data_array.shape[:2]
+    frame_area = max(float(width * height), 1.0)
+    largest_face_area_ratio = 0.0
+
+    for box in face_boxes or []:
+        if len(box) < 4:
+            continue
+
+        x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        face_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        largest_face_area_ratio = max(largest_face_area_ratio, face_area / frame_area)
+
+    rgb_float = rgb_data_array.astype(np.float32) / 255.0
+    luminance = (
+        (0.2126 * rgb_float[:, :, 0])
+        + (0.7152 * rgb_float[:, :, 1])
+        + (0.0722 * rgb_float[:, :, 2])
+    )
+    brightness = round(float(np.mean(luminance)), 4)
+    face_area_ratio = round(largest_face_area_ratio, 4)
+
+    return {
+        "low_light": brightness < CAMERA_LOW_LIGHT_LUMA_THRESHOLD,
+        "too_far": largest_face_area_ratio > 0 and largest_face_area_ratio < CAMERA_MIN_FACE_AREA_RATIO,
+        "face_area_ratio": face_area_ratio,
+        "brightness": brightness,
+        "participant_identity": participant_identity,
+        "role": role if role in {"patient", "doctor"} else "unknown",
+    }
+
+
+def build_pipeline_status_payload(
+    consultation_id: int,
+    room_name: str,
+    status: str,
+    guidance: dict[str, Any] | None = None,
+    error: str | None = None,
+    last_scan_at: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "consultation_id": consultation_id,
+        "status": status,
+        "room_name": room_name,
+        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if guidance is not None:
+        payload["guidance"] = guidance
+
+    if error:
+        payload["error"] = error
+
+    if last_scan_at:
+        payload["last_scan_at"] = last_scan_at
+
+    return payload
+
+
+def build_detection_data_channel_payload(
+    status_payload: dict[str, Any],
+    timeout_seconds: int = 60,
+) -> dict[str, Any]:
+    status = str(status_payload.get("status", "running"))
+    state = "running" if status == "running" else "starting" if status == "started" else "delayed"
+
+    return {
+        "state": state,
+        "status": status,
+        "timeout_seconds": timeout_seconds,
+        "last_heartbeat_at": status_payload.get("heartbeat_at") or datetime.now(timezone.utc).isoformat(),
+        "last_heartbeat_age_seconds": 0,
+        "started_at": None,
+        "last_scan_at": status_payload.get("last_scan_at"),
+        "last_error": status_payload.get("error"),
+        "guidance": status_payload.get("guidance") or {
+            "low_light": False,
+            "too_far": False,
+            "face_area_ratio": None,
+            "brightness": None,
+            "participant_identity": None,
+            "role": None,
+        },
     }
 
 
@@ -2113,6 +2251,58 @@ async def post_internal_json(session: aiohttp.ClientSession, url: str, payload: 
     return stored
 
 
+async def publish_detection_status_to_room(room: Any, status_payload: dict[str, Any]) -> None:
+    local_participant = getattr(room, "local_participant", None)
+    if local_participant is None:
+        return
+
+    data_payload = build_detection_data_channel_payload(status_payload)
+    encoded_payload = json.dumps(data_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    try:
+        result = local_participant.publish_data(
+            encoded_payload,
+            reliable=True,
+            topic="deepfake_detection",
+        )
+        if hasattr(result, "__await__"):
+            await result
+    except Exception as error:
+        logger.debug("Failed to publish deepfake detection data packet: %s", error)
+
+
+async def send_pipeline_status(
+    session: aiohttp.ClientSession,
+    consultation_id: int | None,
+    room_name: str,
+    status: str,
+    guidance: dict[str, Any] | None = None,
+    error: str | None = None,
+    last_scan_at: str | None = None,
+    room: Any | None = None,
+) -> bool:
+    if consultation_id is None:
+        return False
+
+    payload = build_pipeline_status_payload(
+        consultation_id=consultation_id,
+        room_name=room_name,
+        status=status,
+        guidance=guidance,
+        error=error,
+        last_scan_at=last_scan_at,
+    )
+
+    if room is not None:
+        await publish_detection_status_to_room(room, payload)
+
+    return await post_internal_json(
+        session,
+        build_internal_url(f"consultations/{consultation_id}/status"),
+        payload,
+    )
+
+
 async def post_internal_json_with_retryability(
     session: aiohttp.ClientSession,
     url: str,
@@ -2319,6 +2509,7 @@ async def video_track_handler(
     track: rtc.Track,
     participant: rtc.RemoteParticipant | None,
     room_name: str,
+    room: Any | None = None,
 ) -> None:
     import cv2
 
@@ -2384,9 +2575,16 @@ async def video_track_handler(
         patient_results = inference_results.get("patient", {})
         doctor_results = inference_results.get("doctor", {})
         deepfake_results = inference_results.get("deepfake", {})
+        bounding_boxes = detection_results.get("bounding_boxes", [])
+        camera_guidance = classify_camera_guidance(
+            rgb_data,
+            bounding_boxes,
+            participant_identity=participant_identity,
+            role=inferred_role,
+        )
 
         # Draw detection bounding boxes
-        for box in detection_results.get("bounding_boxes", []):
+        for box in bounding_boxes:
             x1, y1, x2, y2, confidence = int(box[0]), int(box[1]), int(box[2]), int(box[3]), float(box[4])
             cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(
@@ -2556,6 +2754,15 @@ async def video_track_handler(
                 http_session,
                 deepfake_scan_payload,
             )
+            await send_pipeline_status(
+                http_session,
+                gallery.consultation_id,
+                room_name,
+                "running",
+                guidance=camera_guidance,
+                last_scan_at=deepfake_scan_payload.get("scanned_at"),
+                room=room,
+            )
             if not stored_scan_result:
                 logger.warning(
                     (
@@ -2578,7 +2785,11 @@ async def entrypoint(ctx: JobContext) -> None:
     configure_logging()
     await ctx.connect(auto_subscribe=AutoSubscribe.VIDEO_ONLY)
     logger.info("Connected to room: %s", ctx.room.name)
-    await run_room_processing_loop(ctx.room, ctx.room.name)
+    await run_room_processing_loop(
+        ctx.room,
+        ctx.room.name,
+        consultation_id=parse_consultation_id_from_room_name(ctx.room.name),
+    )
 
 
 if __name__ == "__main__":
