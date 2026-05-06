@@ -126,6 +126,39 @@ def describe_active_consultation_rooms(rooms: list[Any]) -> str:
     return ", ".join(room_descriptions) if room_descriptions else "none"
 
 
+def summarize_named_items(items: list[Any], limit: int = 3) -> str:
+    names: list[str] = []
+    for item in items:
+        name = str(getattr(item, "room_name", "") or getattr(item, "name", "")).strip()
+        if name == "":
+            continue
+
+        names.append(name)
+
+    if not names:
+        return "none"
+
+    if len(names) <= limit:
+        return ", ".join(names)
+
+    return ", ".join(names[:limit]) + f" (+{len(names) - limit} more)"
+
+
+def format_poll_status(
+    discovered_rooms: list[ActiveConsultationRoom],
+    rooms_to_start: list[ActiveConsultationRoom],
+    rooms_to_stop: list[str],
+) -> str:
+    if not rooms_to_start and not rooms_to_stop:
+        return f"Poll OK: {len(discovered_rooms)} active, no changes"
+
+    start_summary = summarize_named_items(rooms_to_start)
+    stop_summary = ", ".join(rooms_to_stop[:3]) if rooms_to_stop else "none"
+    start_suffix = f" [{start_summary}]" if start_summary != "none" else ""
+    stop_suffix = f" [{stop_summary}]" if stop_summary != "none" else ""
+    return f"Poll OK: {len(discovered_rooms)} active, +{len(rooms_to_start)}{start_suffix}, -{len(rooms_to_stop)}{stop_suffix}"
+
+
 LARAVEL_BASE_URL = os.getenv("LARAVEL_BASE_URL", "http://localhost:8000").rstrip("/")
 LARAVEL_ENDPOINT = os.getenv("LARAVEL_ENDPOINT", f"{LARAVEL_BASE_URL}/api/frame-results")
 PIPELINE_INTERNAL_BASE_URL = os.getenv(
@@ -653,12 +686,9 @@ async def run_pipeline_supervisor() -> None:
                     rooms_to_start_names = describe_active_consultation_rooms(rooms_to_start)
                     rooms_to_stop_names = ", ".join(sorted(rooms_to_stop)) if rooms_to_stop else "none"
                     logger.info(
-                        "Poll OK: rooms=%s workers=%s active=%s start=%s stop=%s",
-                        len(discovered_rooms),
+                        "%s workers=%s",
+                        format_poll_status(discovered_rooms, rooms_to_start, rooms_to_stop),
                         len(worker_states),
-                        discovered_room_names,
-                        rooms_to_start_names,
-                        rooms_to_stop_names,
                     )
 
                     for room_to_start in rooms_to_start:
@@ -668,7 +698,7 @@ async def run_pipeline_supervisor() -> None:
                             task=worker_task,
                             last_seen_at_monotonic=now_monotonic,
                         )
-                        logger.info("Join room: consultation_id=%s room=%s", room_to_start.consultation_id, room_to_start.room_name)
+                        logger.debug("Join room: consultation_id=%s room=%s", room_to_start.consultation_id, room_to_start.room_name)
 
                     for room_name_to_stop in rooms_to_stop:
                         existing_worker_state = worker_states.pop(room_name_to_stop, None)
@@ -691,6 +721,7 @@ async def run_pipeline_supervisor() -> None:
         for room_name, worker_state in list(worker_states.items()):
             await cancel_polled_room_worker(worker_state, reason="supervisor_shutdown")
             worker_states.pop(room_name, None)
+        await close_shared_http_session()
 
 
 def resolve_deepfake_backend(requested_backend: str, fallback_backend: str, strict_mode: bool) -> tuple[str, bool]:
@@ -1823,19 +1854,57 @@ class PipelineManager:
 
 
 pipeline: PipelineManager | None = None
+pipeline_init_error: Exception | None = None
 _pipeline_init_lock = threading.Lock()
+shared_http_session: aiohttp.ClientSession | None = None
+_shared_http_session_lock = threading.Lock()
 
 
 def get_or_create_pipeline() -> PipelineManager:
-    global pipeline
+    global pipeline, pipeline_init_error
+
+    if pipeline_init_error is not None:
+        raise RuntimeError("Pipeline initialization previously failed") from pipeline_init_error
 
     if pipeline is None:
         with _pipeline_init_lock:
             if pipeline is None:
-                logger.info("Lazy-loading InsightFace models on first video track...")
-                pipeline = PipelineManager()
+                try:
+                    logger.info("Loading video pipeline models")
+                    pipeline = PipelineManager()
+                except Exception as error:
+                    pipeline_init_error = error
+                    logger.exception("Video pipeline initialization failed")
+                    raise
 
     return pipeline
+
+
+async def get_or_create_shared_http_session() -> aiohttp.ClientSession:
+    global shared_http_session
+
+    session = shared_http_session
+    if session is not None and not session.closed:
+        return session
+
+    with _shared_http_session_lock:
+        session = shared_http_session
+        if session is None or session.closed:
+            shared_http_session = aiohttp.ClientSession()
+            session = shared_http_session
+
+    return session
+
+
+async def close_shared_http_session() -> None:
+    global shared_http_session
+
+    with _shared_http_session_lock:
+        session = shared_http_session
+        shared_http_session = None
+
+    if session is not None and not session.closed:
+        await session.close()
 
 
 async def post_internal_json(session: aiohttp.ClientSession, url: str, payload: dict[str, Any]) -> bool:
@@ -2052,277 +2121,251 @@ async def video_track_handler(
 ) -> None:
     import cv2
 
-    logger.info("Video track subscribed: %s", track.sid)
+    logger.debug("Track start: %s", track.sid)
 
-    active_pipeline = get_or_create_pipeline()
+    try:
+        active_pipeline = get_or_create_pipeline()
+    except Exception as error:
+        logger.warning("Skipping track %s because the video pipeline is unavailable: %s", track.sid, error)
+        return
+
     video_stream = rtc.VideoStream(track, capacity=VIDEO_STREAM_CAPACITY)
-    logger.info("Video stream configured with capacity=%s for track=%s", VIDEO_STREAM_CAPACITY, track.sid)
     last_analyzed_timestamp_us: int | None = None
     analyzed_frame_number = 0
     os.makedirs(SAVED_FRAMES_DIR, exist_ok=True)
 
-    async with aiohttp.ClientSession() as http_session:
-        gallery = FaceGallery()
-        await gallery.load_for_room(room_name, http_session, active_pipeline)
-        await refresh_consultation_context_once(gallery, room_name, http_session, active_pipeline)
+    http_session = await get_or_create_shared_http_session()
+    gallery = FaceGallery()
+    await gallery.load_for_room(room_name, http_session, active_pipeline)
+    await refresh_consultation_context_once(gallery, room_name, http_session, active_pipeline)
 
-        participant_identity = str(getattr(participant, "identity", "unknown"))
-        inferred_role, inferred_user_id = gallery.resolve_track_subject(participant)
-        configured_target = VERIFICATION_TARGET if VERIFICATION_TARGET in {"patient", "doctor", "both"} else "both"
-        target_role: str | None
+    participant_identity = str(getattr(participant, "identity", "unknown"))
+    inferred_role, inferred_user_id = gallery.resolve_track_subject(participant)
+    configured_target = VERIFICATION_TARGET if VERIFICATION_TARGET in {"patient", "doctor", "both"} else "both"
+    target_role: str | None
 
-        if PARTICIPANT_AWARE_VERIFICATION and inferred_role in {"patient", "doctor"}:
-            target_role = inferred_role
-            logger.info(
-                "Participant-aware verification: identity=%s inferred_role=%s inferred_user_id=%s",
-                participant_identity,
-                inferred_role,
-                inferred_user_id,
+    if PARTICIPANT_AWARE_VERIFICATION and inferred_role in {"patient", "doctor"}:
+        target_role = inferred_role
+    else:
+        target_role = configured_target
+
+    should_report_deepfake = should_report_deepfake_for_role(inferred_role)
+    logger.debug(
+        "Track ready: room=%s participant=%s role=%s target=%s deepfake=%s",
+        room_name,
+        participant_identity,
+        inferred_role or "unknown",
+        target_role,
+        "on" if should_report_deepfake else "off",
+    )
+
+    async for event in video_stream:
+        frame_timestamp_us = int(event.timestamp_us)
+        if not should_analyze_frame_timestamp(
+            last_analyzed_timestamp_us,
+            frame_timestamp_us,
+            FRAME_ANALYSIS_INTERVAL_SECONDS,
+        ):
+            continue
+
+        last_analyzed_timestamp_us = frame_timestamp_us
+        analyzed_frame_number += 1
+
+        rtc_frame = event.frame
+        argb_frame = rtc_frame.convert(rtc.VideoBufferType.ARGB)
+        frame_data = np.frombuffer(argb_frame.data, dtype=np.uint8)
+        rgb_data = frame_data.reshape((argb_frame.height, argb_frame.width, 4))[:, :, 1:]
+
+        inference_results = await active_pipeline.run_inference(rgb_data, gallery, target_role=target_role)
+
+        bgr_frame = cv2.cvtColor(rgb_data, cv2.COLOR_RGB2BGR)
+        detection_results = inference_results.get("model_A", {})
+        patient_results = inference_results.get("patient", {})
+        doctor_results = inference_results.get("doctor", {})
+        deepfake_results = inference_results.get("deepfake", {})
+
+        # Draw detection bounding boxes
+        for box in detection_results.get("bounding_boxes", []):
+            x1, y1, x2, y2, confidence = int(box[0]), int(box[1]), int(box[2]), int(box[3]), float(box[4])
+            cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                bgr_frame,
+                f"face {confidence:.2f}",
+                (x1, max(y1 - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
             )
-        else:
-            target_role = configured_target
-            logger.info(
-                "Fallback verification target: identity=%s target=%s participant_aware=%s inferred_role=%s inferred_user_id=%s",
-                participant_identity,
-                configured_target,
-                PARTICIPANT_AWARE_VERIFICATION,
-                inferred_role,
-                inferred_user_id,
+
+        # Draw patient recognition box (blue for patient)
+        if patient_results.get("best_box") is not None:
+            x1, y1, x2, y2 = patient_results["best_box"]
+            similarity = patient_results.get("best_similarity")
+            matched = patient_results.get("matched")
+            label = f"patient-match {similarity}" if matched else f"patient-nomatch {similarity}"
+            color = (255, 0, 0) if matched else (0, 0, 255)  # Blue if match, Red if no match
+            cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), color, 3)
+            cv2.putText(
+                bgr_frame,
+                label,
+                (x1, max(y1 - 35, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
             )
 
-        should_report_deepfake = should_report_deepfake_for_role(inferred_role)
-        logger.info(
-            "Deepfake reporting gate: role_mode=%s inferred_role=%s enabled=%s track=%s",
-            DEEPFAKE_REPORTING_ROLE,
-            inferred_role,
-            should_report_deepfake,
-            track.sid,
+        # Draw doctor recognition box (cyan for doctor)
+        if doctor_results.get("best_box") is not None:
+            x1, y1, x2, y2 = doctor_results["best_box"]
+            similarity = doctor_results.get("best_similarity")
+            matched = doctor_results.get("matched")
+            label = f"doctor-match {similarity}" if matched else f"doctor-nomatch {similarity}"
+            color = (255, 255, 0) if matched else (0, 165, 255)  # Cyan if match, Orange if no match
+            cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), color, 3)
+            cv2.putText(
+                bgr_frame,
+                label,
+                (x1, min(y2 + 35, argb_frame.height - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+            )
+
+        draw_text_overlay(bgr_frame, build_deepfake_overlay_lines(deepfake_results))
+
+        frame_filename = os.path.join(
+            SAVED_FRAMES_DIR,
+            build_saved_frame_filename(gallery.consultation_id, analyzed_frame_number, event.timestamp_us, track.sid),
         )
+        cv2.imwrite(frame_filename, bgr_frame)
+        logger.debug("Saved analyzed frame to %s", frame_filename)
 
-        async for event in video_stream:
-            frame_timestamp_us = int(event.timestamp_us)
-            if not should_analyze_frame_timestamp(
-                last_analyzed_timestamp_us,
-                frame_timestamp_us,
-                FRAME_ANALYSIS_INTERVAL_SECONDS,
-            ):
+        frame_payload = {
+            "track_id": track.sid,
+            "timestamp": frame_timestamp_us,
+            "width": argb_frame.width,
+            "height": argb_frame.height,
+            "image": None,
+            "ml_results": inference_results,
+        }
+        asyncio.create_task(send_frame_results(http_session, frame_payload))
+
+        # Send separate match reports for patient and doctor
+        if target_role in (None, "patient", "both") and patient_results.get("reference_loaded"):
+            patient_report = gallery.build_match_report(patient_results, role="patient")
+            if patient_report is not None:
+                asyncio.create_task(send_face_match_result(http_session, patient_report))
+
+        if target_role in (None, "doctor", "both") and doctor_results.get("reference_loaded"):
+            doctor_report = gallery.build_match_report(doctor_results, role="doctor")
+            if doctor_report is not None:
+                asyncio.create_task(send_face_match_result(http_session, doctor_report))
+
+        if should_report_deepfake and deepfake_results:
+            if gallery.consultation_id is None:
+                logger.warning("Skipping deepfake scan submission because consultation id is unavailable")
                 continue
 
-            last_analyzed_timestamp_us = frame_timestamp_us
-            analyzed_frame_number += 1
-
-            rtc_frame = event.frame
-            argb_frame = rtc_frame.convert(rtc.VideoBufferType.ARGB)
-            frame_data = np.frombuffer(argb_frame.data, dtype=np.uint8)
-            rgb_data = frame_data.reshape((argb_frame.height, argb_frame.width, 4))[:, :, 1:]
-
-            inference_results = await active_pipeline.run_inference(rgb_data, gallery, target_role=target_role)
-
-            bgr_frame = cv2.cvtColor(rgb_data, cv2.COLOR_RGB2BGR)
-            detection_results = inference_results.get("model_A", {})
-            patient_results = inference_results.get("patient", {})
-            doctor_results = inference_results.get("doctor", {})
-            deepfake_results = inference_results.get("deepfake", {})
-
-            # Draw detection bounding boxes
-            for box in detection_results.get("bounding_boxes", []):
-                x1, y1, x2, y2, confidence = int(box[0]), int(box[1]), int(box[2]), int(box[3]), float(box[4])
-                cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    bgr_frame,
-                    f"face {confidence:.2f}",
-                    (x1, max(y1 - 10, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                )
-
-            # Draw patient recognition box (blue for patient)
-            if patient_results.get("best_box") is not None:
-                x1, y1, x2, y2 = patient_results["best_box"]
-                similarity = patient_results.get("best_similarity")
-                matched = patient_results.get("matched")
-                label = f"patient-match {similarity}" if matched else f"patient-nomatch {similarity}"
-                color = (255, 0, 0) if matched else (0, 0, 255)  # Blue if match, Red if no match
-                cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), color, 3)
-                cv2.putText(
-                    bgr_frame,
-                    label,
-                    (x1, max(y1 - 35, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    color,
-                    2,
-                )
-
-            # Draw doctor recognition box (cyan for doctor)
-            if doctor_results.get("best_box") is not None:
-                x1, y1, x2, y2 = doctor_results["best_box"]
-                similarity = doctor_results.get("best_similarity")
-                matched = doctor_results.get("matched")
-                label = f"doctor-match {similarity}" if matched else f"doctor-nomatch {similarity}"
-                color = (255, 255, 0) if matched else (0, 165, 255)  # Cyan if match, Orange if no match
-                cv2.rectangle(bgr_frame, (x1, y1), (x2, y2), color, 3)
-                cv2.putText(
-                    bgr_frame,
-                    label,
-                    (x1, min(y2 + 35, argb_frame.height - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    color,
-                    2,
-                )
-
-            draw_text_overlay(bgr_frame, build_deepfake_overlay_lines(deepfake_results))
-
-            frame_filename = os.path.join(
-                SAVED_FRAMES_DIR,
-                build_saved_frame_filename(gallery.consultation_id, analyzed_frame_number, event.timestamp_us, track.sid),
+            claim_role, claim_user_id = resolve_claim_subject_for_scan(
+                inferred_role=inferred_role,
+                inferred_user_id=inferred_user_id,
+                gallery=gallery,
             )
-            cv2.imwrite(frame_filename, bgr_frame)
-            logger.info("Saved analyzed frame to %s", frame_filename)
 
-            frame_payload = {
-                "track_id": track.sid,
-                "timestamp": frame_timestamp_us,
-                "width": argb_frame.width,
-                "height": argb_frame.height,
-                "image": None,
-                "ml_results": inference_results,
-            }
-            asyncio.create_task(send_frame_results(http_session, frame_payload))
+            if claim_user_id is None or claim_role is None:
+                logger.warning("Skipping deepfake scan submission because participant identity could not be resolved")
+                continue
 
-            # Send separate match reports for patient and doctor
-            if target_role in (None, "patient", "both") and patient_results.get("reference_loaded"):
-                patient_report = gallery.build_match_report(patient_results, role="patient")
-                if patient_report is not None:
-                    asyncio.create_task(send_face_match_result(http_session, patient_report))
+            claim_response = await claim_due_microcheck_with_retry(
+                http_session,
+                consultation_id=gallery.consultation_id,
+                user_id=claim_user_id,
+                verified_role=claim_role,
+            )
 
-            if target_role in (None, "doctor", "both") and doctor_results.get("reference_loaded"):
-                doctor_report = gallery.build_match_report(doctor_results, role="doctor")
-                if doctor_report is not None:
-                    asyncio.create_task(send_face_match_result(http_session, doctor_report))
+            if claim_response is None:
+                logger.warning(
+                    (
+                        "Skipping deepfake scan submission because claim request failed after retries. "
+                        "consultation_id=%s track=%s role=%s user_id=%s"
+                    ),
+                    gallery.consultation_id,
+                    track.sid,
+                    claim_role,
+                    claim_user_id,
+                )
+                continue
 
-            if should_report_deepfake and deepfake_results:
-                if gallery.consultation_id is None:
-                    logger.warning(
-                        "Skipping deepfake scan submission because consultation id is unavailable. track=%s frame=%s",
-                        track.sid,
-                        analyzed_frame_number,
-                    )
-                    continue
+            if not claim_response.get("claimed"):
+                logger.info(
+                    "No due microcheck available for claim. consultation_id=%s role=%s user_id=%s reason=%s next_scheduled_at=%s",
+                    gallery.consultation_id,
+                    claim_role,
+                    claim_user_id,
+                    claim_response.get("reason"),
+                    claim_response.get("next_scheduled_at"),
+                )
+                continue
 
-                claim_role, claim_user_id = resolve_claim_subject_for_scan(
-                    inferred_role=inferred_role,
-                    inferred_user_id=inferred_user_id,
-                    gallery=gallery,
+            microcheck_payload = claim_response.get("microcheck") or {}
+            microcheck_id = microcheck_payload.get("id")
+            if not isinstance(microcheck_id, int):
+                logger.warning("Claimed microcheck payload missing numeric id for consultation %s", gallery.consultation_id)
+                continue
+
+            role_inference_result = patient_results if claim_role == "patient" else doctor_results
+            face_match_payload = build_face_match_payload(
+                consultation_id=gallery.consultation_id,
+                microcheck_id=microcheck_id,
+                user_id=claim_user_id,
+                verified_role=claim_role,
+                recognition_result=role_inference_result,
+            )
+            stored_face_match = await send_face_match_result_with_retry(
+                http_session,
+                face_match_payload,
+            )
+            if not stored_face_match:
+                logger.warning(
+                    (
+                        "Face match submission failed after retries. "
+                        "consultation_id=%s microcheck_id=%s role=%s user_id=%s track=%s frame=%s"
+                    ),
+                    gallery.consultation_id,
+                    microcheck_id,
+                    claim_role,
+                    claim_user_id,
+                    track.sid,
+                    analyzed_frame_number,
                 )
 
-                if claim_user_id is None or claim_role is None:
-                    logger.warning(
-                        (
-                            "Skipping deepfake scan submission due to unresolved participant identity. "
-                            "consultation_id=%s track=%s identity=%s inferred_role=%s inferred_user_id=%s "
-                            "patient_id=%s doctor_id=%s"
-                        ),
-                        gallery.consultation_id,
-                        track.sid,
-                        participant_identity,
-                        inferred_role,
-                        inferred_user_id,
-                        gallery.patient_id,
-                        gallery.doctor_id,
-                    )
-                    continue
-
-                claim_response = await claim_due_microcheck_with_retry(
-                    http_session,
-                    consultation_id=gallery.consultation_id,
-                    user_id=claim_user_id,
-                    verified_role=claim_role,
+            deepfake_scan_payload = build_scan_result_payload(
+                consultation_id=gallery.consultation_id,
+                microcheck_id=microcheck_id,
+                user_id=claim_user_id,
+                verified_role=claim_role,
+                deepfake_result=deepfake_results,
+                frame_path=frame_filename,
+                frame_number=analyzed_frame_number,
+            )
+            stored_scan_result = await send_scan_result_with_retry(
+                http_session,
+                deepfake_scan_payload,
+            )
+            if not stored_scan_result:
+                logger.warning(
+                    (
+                        "Deepfake scan submission failed after retries. "
+                        "consultation_id=%s microcheck_id=%s track=%s frame=%s"
+                    ),
+                    gallery.consultation_id,
+                    microcheck_id,
+                    track.sid,
+                    analyzed_frame_number,
                 )
-
-                if claim_response is None:
-                    logger.warning(
-                        (
-                            "Skipping deepfake scan submission because claim request failed after retries. "
-                            "consultation_id=%s track=%s role=%s user_id=%s"
-                        ),
-                        gallery.consultation_id,
-                        track.sid,
-                        claim_role,
-                        claim_user_id,
-                    )
-                    continue
-
-                if not claim_response.get("claimed"):
-                    logger.info(
-                        "No due microcheck available for claim. consultation_id=%s role=%s user_id=%s reason=%s next_scheduled_at=%s",
-                        gallery.consultation_id,
-                        claim_role,
-                        claim_user_id,
-                        claim_response.get("reason"),
-                        claim_response.get("next_scheduled_at"),
-                    )
-                    continue
-
-                microcheck_payload = claim_response.get("microcheck") or {}
-                microcheck_id = microcheck_payload.get("id")
-                if not isinstance(microcheck_id, int):
-                    logger.warning("Claimed microcheck payload missing numeric id for consultation %s", gallery.consultation_id)
-                    continue
-
-                role_inference_result = patient_results if claim_role == "patient" else doctor_results
-                face_match_payload = build_face_match_payload(
-                    consultation_id=gallery.consultation_id,
-                    microcheck_id=microcheck_id,
-                    user_id=claim_user_id,
-                    verified_role=claim_role,
-                    recognition_result=role_inference_result,
-                )
-                stored_face_match = await send_face_match_result_with_retry(
-                    http_session,
-                    face_match_payload,
-                )
-                if not stored_face_match:
-                    logger.warning(
-                        (
-                            "Face match submission failed after retries. "
-                            "consultation_id=%s microcheck_id=%s role=%s user_id=%s track=%s frame=%s"
-                        ),
-                        gallery.consultation_id,
-                        microcheck_id,
-                        claim_role,
-                        claim_user_id,
-                        track.sid,
-                        analyzed_frame_number,
-                    )
-
-                deepfake_scan_payload = build_scan_result_payload(
-                    consultation_id=gallery.consultation_id,
-                    microcheck_id=microcheck_id,
-                    user_id=claim_user_id,
-                    verified_role=claim_role,
-                    deepfake_result=deepfake_results,
-                    frame_path=frame_filename,
-                    frame_number=analyzed_frame_number,
-                )
-                stored_scan_result = await send_scan_result_with_retry(
-                    http_session,
-                    deepfake_scan_payload,
-                )
-                if not stored_scan_result:
-                    logger.warning(
-                        (
-                            "Deepfake scan submission failed after retries. "
-                            "consultation_id=%s microcheck_id=%s track=%s frame=%s"
-                        ),
-                        gallery.consultation_id,
-                        microcheck_id,
-                        track.sid,
-                        analyzed_frame_number,
-                    )
 
 
 def prewarm(process: JobProcess) -> None:
