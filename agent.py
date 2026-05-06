@@ -1327,6 +1327,7 @@ def build_detection_data_channel_payload(
 ) -> dict[str, Any]:
     status = str(status_payload.get("status", "running"))
     state = "running" if status == "running" else "starting" if status == "started" else "delayed"
+    guidance = status_payload.get("guidance") or {}
 
     return {
         "state": state,
@@ -1336,14 +1337,11 @@ def build_detection_data_channel_payload(
         "last_heartbeat_age_seconds": 0,
         "started_at": None,
         "last_scan_at": status_payload.get("last_scan_at"),
-        "last_error": status_payload.get("error"),
-        "guidance": status_payload.get("guidance") or {
-            "low_light": False,
-            "too_far": False,
-            "face_area_ratio": None,
-            "brightness": None,
-            "participant_identity": None,
-            "role": None,
+        "guidance": {
+            "low_light": bool(guidance.get("low_light", False)),
+            "too_far": bool(guidance.get("too_far", False)),
+            "face_area_ratio": guidance.get("face_area_ratio"),
+            "brightness": guidance.get("brightness"),
         },
     }
 

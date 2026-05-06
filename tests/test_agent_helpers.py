@@ -268,6 +268,9 @@ class AgentHelperFunctionsTest(unittest.TestCase):
 
         self.assertEqual(payload["state"], "running")
         self.assertEqual(payload["guidance"]["low_light"], True)
+        self.assertNotIn("participant_identity", payload["guidance"])
+        self.assertNotIn("role", payload["guidance"])
+        self.assertNotIn("last_error", payload)
         self.assertEqual(payload["last_heartbeat_age_seconds"], 0)
 
     def test_classify_camera_guidance_flags_low_light(self) -> None:
