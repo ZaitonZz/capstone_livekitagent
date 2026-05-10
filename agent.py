@@ -687,6 +687,7 @@ async def cancel_polled_room_worker(
 async def run_room_processing_loop(room: Any, room_name: str, consultation_id: int | None = None) -> None:
     active_track_tasks: dict[str, asyncio.Task[Any]] = {}
     track_owner_identity: dict[str, str] = {}
+    latest_camera_guidance_by_track: dict[str, dict[str, Any]] = {}
     http_session = await get_or_create_shared_http_session()
     status_heartbeat_task: asyncio.Task[Any] | None = None
 
@@ -696,6 +697,7 @@ async def run_room_processing_loop(room: Any, room_name: str, consultation_id: i
             consultation_id,
             room_name,
             "started",
+            guidance=select_room_camera_guidance(latest_camera_guidance_by_track),
             room=room,
         )
 
@@ -706,8 +708,25 @@ async def run_room_processing_loop(room: Any, room_name: str, consultation_id: i
                 consultation_id,
                 room_name,
                 "running",
+                guidance=select_room_camera_guidance(latest_camera_guidance_by_track),
                 room=room,
             )
+
+    def publish_camera_guidance(track_sid: str, guidance: dict[str, Any]) -> None:
+        if consultation_id is None:
+            return
+
+        latest_camera_guidance_by_track[track_sid] = guidance
+        asyncio.create_task(
+            send_pipeline_status(
+                http_session,
+                consultation_id,
+                room_name,
+                "running",
+                guidance=select_room_camera_guidance(latest_camera_guidance_by_track),
+                room=room,
+            )
+        )
 
     if consultation_id is not None:
         status_heartbeat_task = asyncio.create_task(status_heartbeat_loop())
@@ -761,7 +780,15 @@ async def run_room_processing_loop(room: Any, room_name: str, consultation_id: i
             return False
 
         participant_identity = str(getattr(participant, "identity", "unknown"))
-        handler_task = asyncio.create_task(video_track_handler(track, participant, room_name=room_name, room=room))
+        handler_task = asyncio.create_task(
+            video_track_handler(
+                track,
+                participant,
+                room_name=room_name,
+                room=room,
+                camera_guidance_callback=publish_camera_guidance,
+            )
+        )
         active_track_tasks[track_sid] = handler_task
         track_owner_identity[track_sid] = participant_identity
         logger.info(
@@ -777,6 +804,7 @@ async def run_room_processing_loop(room: Any, room_name: str, consultation_id: i
             if tracked_task is done_task:
                 active_track_tasks.pop(sid, None)
                 track_owner_identity.pop(sid, None)
+                latest_camera_guidance_by_track.pop(sid, None)
 
             try:
                 done_task.result()
@@ -816,7 +844,6 @@ async def run_room_processing_loop(room: Any, room_name: str, consultation_id: i
             getattr(participant, "identity", "unknown"),
             room_name,
         )
-        publish_no_face_guidance(participant, "track_unsubscribed")
         existing_task.cancel()
 
     @room.on("track_muted")
@@ -1350,6 +1377,26 @@ def classify_camera_guidance(
         "participant_identity": participant_identity,
         "role": role if role in {"patient", "doctor"} else "unknown",
     }
+
+
+def select_room_camera_guidance(camera_guidance_by_track: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    active_guidance = [
+        guidance
+        for guidance in camera_guidance_by_track.values()
+        if isinstance(guidance, dict)
+    ]
+    if not active_guidance:
+        return None
+
+    visible_face_guidance = [
+        guidance
+        for guidance in active_guidance
+        if not bool(guidance.get("no_face_detected", False))
+    ]
+    if visible_face_guidance:
+        return visible_face_guidance[-1]
+
+    return active_guidance[-1]
 
 
 def build_pipeline_status_payload(
@@ -2566,6 +2613,7 @@ async def video_track_handler(
     participant: rtc.RemoteParticipant | None,
     room_name: str,
     room: Any | None = None,
+    camera_guidance_callback: Any | None = None,
 ) -> None:
     import cv2
 
@@ -2638,6 +2686,10 @@ async def video_track_handler(
             participant_identity=participant_identity,
             role=inferred_role,
         )
+        if camera_guidance_callback is not None:
+            callback_result = camera_guidance_callback(track.sid, camera_guidance)
+            if hasattr(callback_result, "__await__"):
+                await callback_result
 
         # Draw detection bounding boxes
         for box in bounding_boxes:

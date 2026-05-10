@@ -36,6 +36,7 @@ from agent import (
     resolve_deepfake_backend,
     resolve_fake_class_index_for_backend,
     resolve_claim_subject_for_scan,
+    select_room_camera_guidance,
     should_analyze_frame_timestamp,
     should_retry_http_status,
     should_report_deepfake_for_role,
@@ -286,6 +287,41 @@ class AgentHelperFunctionsTest(unittest.TestCase):
 
         self.assertEqual(guidance["no_face_detected"], False)
         self.assertEqual(guidance["role"], "doctor")
+
+    def test_select_room_camera_guidance_prefers_active_visible_face(self) -> None:
+        selected = select_room_camera_guidance(
+            {
+                "TR_removed": {
+                    "no_face_detected": True,
+                    "participant_identity": "removed-user",
+                    "role": "patient",
+                },
+                "TR_active": {
+                    "no_face_detected": False,
+                    "participant_identity": "active-user",
+                    "role": "doctor",
+                },
+            }
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["participant_identity"], "active-user")
+        self.assertEqual(selected["no_face_detected"], False)
+
+    def test_select_room_camera_guidance_returns_no_face_when_all_tracks_have_no_face(self) -> None:
+        selected = select_room_camera_guidance(
+            {
+                "TR_patient": {
+                    "no_face_detected": True,
+                    "participant_identity": "patient-user",
+                    "role": "patient",
+                },
+            }
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["participant_identity"], "patient-user")
+        self.assertEqual(selected["no_face_detected"], True)
 
     def test_build_no_face_guidance_for_participant_uses_metadata_role(self) -> None:
         participant = Mock()
